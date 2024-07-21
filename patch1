@@ -1,0 +1,379 @@
+diff --git a/axidmatest.c b/my_axidmatest.c
+index 35718fc..1bb9e7f 100644
+--- a/axidmatest.c
++++ b/my_axidmatest.c
+@@ -13,6 +13,7 @@
+ #include <linux/delay.h>
+ #include <linux/dmaengine.h>
+ #include <linux/init.h>
++#include <linux/cdev.h>
+ #include <linux/kthread.h>
+ #include <linux/module.h>
+ #include <linux/of_dma.h>
+@@ -22,7 +23,12 @@
+ #include <linux/wait.h>
+ #include <linux/sched/task.h>
+ #include <linux/dma/xilinx_dma.h>
+-
++#include <asm/siginfo.h>    //siginfo
++#include <linux/rcupdate.h> //rcu_read_lock
++#include <linux/sched.h>    //find_task_by_pid_type
++#include <linux/sched/signal.h>
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Tran Dinh Nam");
+ static unsigned int test_buf_size = 16384;
+ module_param(test_buf_size, uint, 0444);
+ MODULE_PARM_DESC(test_buf_size, "Size of the memcpy test buffer");
+@@ -32,6 +38,14 @@ module_param(iterations, uint, 0444);
+ MODULE_PARM_DESC(iterations,
+ 		 "Iterations before stopping test (default: infinite)");
+ 
++char config_data[1024];
++struct kernel_siginfo info;
++struct task_struct *t;
++static int pid = 0;
++#define MAGIC_NO	100
++#define SET_PID_CMD	_IOW(MAGIC_NO, 1, int)
++#define SIG_TEST 44
++
+ /*
+  * Initialization patterns. All bytes in the source buffer has bit 7
+  * set, all bytes in the destination buffer has bit 7 cleared.
+@@ -68,6 +82,61 @@ struct dmatest_chan {
+ 	struct list_head threads;
+ };
+ 
++/*
++ * Ops file function for user space to interact with 
++ * character device file.
++ */
++
++static int file_open (struct inode * inode, struct file *file) {
++	pr_info("/dev/device_axidma opened");
++	return 0;
++}
++static int file_release (struct inode * inode, struct file *file){
++	pr_info("/dev/device_axidma opened");
++	return 0;	
++}
++static ssize_t file_write (struct file * file, const char __user * buff, size_t length, loff_t * loff_of);
++static ssize_t file_read (struct file * file,char __user * buff, size_t length, loff_t * loff_of);
++static long file_ioctl(struct file *filep, unsigned int cmd, unsigned long arg){
++	switch(cmd){ 
++		case SET_PID_CMD:
++			//memset(config_data, 0, 1024);
++			if(copy_from_user(&pid, (int*)arg,sizeof(int))){
++				pr_info("error at %d \n",__LINE__);
++				return -1;
++			};
++			printk(KERN_INFO "NamTran %s, %d, pid = %d\n", __func__, __LINE__, pid);
++		break;
++
++		default:
++			return -1;
++	}
++	memset(&info, 0 , sizeof(struct kernel_siginfo));
++	info.si_signo = SIG_TEST;
++	info.si_code = SI_QUEUE;
++	info.si_int = 15;
++
++	return 0;
++}
++
++struct file_operations axidma_fops = {
++	.owner      = THIS_MODULE,
++    .read       = file_read,
++    .write      = file_write,
++    .open       = file_open,
++    .release    = file_release,
++	.unlocked_ioctl  = file_ioctl,
++};
++
++struct axidma_driver {
++	struct class* class;
++	struct device* device;
++	dev_t dev;
++	struct cdev cdev;
++	struct device* container;
++};
++
++struct axidma_driver my_axidma_driver;
+ /*
+  * These are protected by dma_list_mutex since they're only used by
+  * the DMA filter function callback
+@@ -261,9 +330,15 @@ static int dmatest_slave_func(void *data)
+ 	dst_cnt = bd_cnt;
+ 	src_cnt = bd_cnt;
+ 
++	/*
++	Alloc a two dimension pointer.
++	*/
+ 	thread->srcs = kcalloc(src_cnt + 1, sizeof(u8 *), GFP_KERNEL);
+ 	if (!thread->srcs)
+ 		goto err_srcs;
++	/*
++	Alloc a matrix for srcs buffer.
++	*/
+ 	for (i = 0; i < src_cnt; i++) {
+ 		thread->srcs[i] = kmalloc(test_buf_size, GFP_KERNEL);
+ 		if (!thread->srcs[i])
+@@ -271,9 +346,16 @@ static int dmatest_slave_func(void *data)
+ 	}
+ 	thread->srcs[i] = NULL;
+ 
++	/*
++	Alloc a two dimension pointer
++	*/
+ 	thread->dsts = kcalloc(dst_cnt + 1, sizeof(u8 *), GFP_KERNEL);
+ 	if (!thread->dsts)
+ 		goto err_dsts;
++
++	/*
++	Alloc a matrix for dest buffer.
++	*/
+ 	for (i = 0; i < dst_cnt; i++) {
+ 		thread->dsts[i] = kmalloc(test_buf_size, GFP_KERNEL);
+ 		if (!thread->dsts[i])
+@@ -281,13 +363,22 @@ static int dmatest_slave_func(void *data)
+ 	}
+ 	thread->dsts[i] = NULL;
+ 
++	/* 
++	Set nice value (Priority) of this thread to 10.
++	*/
+ 	set_user_nice(current, 10);
+ 
+ 	flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
+-
++	
+ 	ktime = ktime_get();
++	/*
++	Catch any stop request and check if the test validated greater than iterations.
++	*/
+ 	while (!kthread_should_stop() &&
+ 	       !(iterations && total_tests >= iterations)) {
++		/*
++		Get the dma_device from tx_chan and rx_chan got from dmatest_add_slave_threads
++		*/
+ 		struct dma_device *tx_dev = tx_chan->device;
+ 		struct dma_device *rx_dev = rx_chan->device;
+ 		struct dma_async_tx_descriptor *txd = NULL;
+@@ -316,44 +407,70 @@ static int dmatest_slave_func(void *data)
+ 			break;
+ 		}
+ 
++	 	/*
++		Random a length value and round it to the 2^x value.
++		*/
+ 		len = dmatest_random() % test_buf_size + 1;
+ 		len = (len >> align) << align;
+ 		if (!len)
+ 			len = 1 << align;
++		/*
++		Accumulate the total_len
++		*/
+ 		total_len += len;
+ 		src_off = dmatest_random() % (test_buf_size - len + 1);
+ 		dst_off = dmatest_random() % (test_buf_size - len + 1);
+ 
++		/*
++		Align the src_off and dst_off to the 2^x value.
++		*/
+ 		src_off = (src_off >> align) << align;
+ 		dst_off = (dst_off >> align) << align;
+ 
+ 		start = ktime_get();
++
+ 		dmatest_init_srcs(thread->srcs, src_off, len);
+ 		dmatest_init_dsts(thread->dsts, dst_off, len);
+ 		diff = ktime_sub(ktime_get(), start);
++		/*
++		Increase the filltime
++		 */
+ 		filltime = ktime_add(filltime, diff);
+ 
+ 		for (i = 0; i < src_cnt; i++) {
+ 			u8 *buf = thread->srcs[i] + src_off;
+-
++			/*
++			Allocate physic address of the subarray from source_off to (source_off + len) of each array in source buffer. 
++			*/
+ 			dma_srcs[i] = dma_map_single(tx_dev->dev, buf, len,
+ 						     DMA_MEM_TO_DEV);
+ 		}
+ 
+ 		for (i = 0; i < dst_cnt; i++) {
++			/*
++			Allocate physic address of the subarray from 0 to test_buf_size of each array in dest buffer. 
++			*/
+ 			dma_dsts[i] = dma_map_single(rx_dev->dev,
+ 						     thread->dsts[i],
+ 						     test_buf_size,
+ 						     DMA_BIDIRECTIONAL);
+ 		}
+ 
++		/*
++		Init the scatter gather list with 11 elenment 
++		*/
+ 		sg_init_table(tx_sg, bd_cnt);
+ 		sg_init_table(rx_sg, bd_cnt);
+ 
+ 		for (i = 0; i < bd_cnt; i++) {
++			/*
++			Init the physic address of tx_channel and rx_channel are source_off and dst_off
++			*/
+ 			sg_dma_address(&tx_sg[i]) = dma_srcs[i];
+ 			sg_dma_address(&rx_sg[i]) = dma_dsts[i] + dst_off;
+-
++			/*
++		 	Init the transfer length for tx and rx channel
++			*/
+ 			sg_dma_len(&tx_sg[i]) = len;
+ 			sg_dma_len(&rx_sg[i]) = len;
+ 		}
+@@ -380,7 +497,9 @@ static int dmatest_slave_func(void *data)
+ 			failed_tests++;
+ 			continue;
+ 		}
+-
++		/*
++		Init rx_completion, this used to mark at slave_rx_callback func
++		*/
+ 		init_completion(&rx_cmp);
+ 		rxd->callback = dmatest_slave_rx_callback;
+ 		rxd->callback_param = &rx_cmp;
+@@ -444,7 +563,9 @@ static int dmatest_slave_func(void *data)
+ 			continue;
+ 		}
+ 
+-		/* Unmap by myself */
++		/*
++		Unmap the dest buffer
++		*/
+ 		for (i = 0; i < dst_cnt; i++)
+ 			dma_unmap_single(rx_dev->dev, dma_dsts[i],
+ 					 test_buf_size, DMA_BIDIRECTIONAL);
+@@ -532,6 +653,20 @@ static void dmatest_cleanup_channel(struct dmatest_chan *dtc)
+ 	kfree(dtc);
+ }
+ 
++static void dmatest_clean_all_threads(struct dmatest_chan *dtc){
++	struct dmatest_slave_thread *thread;
++	struct dmatest_slave_thread *_thread;
++	int ret;
++
++	list_for_each_entry_safe(thread, _thread, &dtc->threads, node) {
++		ret = kthread_stop(thread->task);
++		pr_debug("dmatest: thread %s exited with status %d\n",
++			 thread->task->comm, ret);
++		list_del(&thread->node);
++		put_task_struct(thread->task);
++		kfree(thread);
++	}
++}
+ static int dmatest_add_slave_threads(struct dmatest_chan *tx_dtc,
+ 				     struct dmatest_chan *rx_dtc)
+ {
+@@ -552,6 +687,10 @@ static int dmatest_add_slave_threads(struct dmatest_chan *tx_dtc,
+ 
+ 	/* Ensure that all previous writes are complete */
+ 	smp_wmb();
++	/*
++	Create a task_struct with the function executed is dmatest_slave_func
++	and input parameter is (void*) thread pointer
++	*/
+ 	thread->task = kthread_run(dmatest_slave_func, thread, "%s-%s",
+ 				   dma_chan_name(tx_chan),
+ 				   dma_chan_name(rx_chan));
+@@ -564,7 +703,13 @@ static int dmatest_add_slave_threads(struct dmatest_chan *tx_dtc,
+ 	}
+ 
+ 	/* srcbuf and dstbuf are allocated by the thread itself */
++	/* 
++	Increase the reference count of the given task_struct.
++	*/
+ 	get_task_struct(thread->task);
++	/*
++	Add the node of thread to the node list tx_dtc->threads
++	*/
+ 	list_add_tail(&thread->node, &tx_dtc->threads);
+ 
+ 	/* Added one thread with 2 channels */
+@@ -603,21 +748,65 @@ static int dmatest_add_slave_channels(struct dma_chan *tx_chan,
+ 	pr_info("dmatest: Started %u threads using %s %s\n",
+ 		thread_count, dma_chan_name(tx_chan), dma_chan_name(rx_chan));
+ 
++	/*
++	Add two dmatest_chan to the list dmatest_channels.
++	 */
+ 	list_add_tail(&tx_dtc->node, &dmatest_channels);
+ 	list_add_tail(&rx_dtc->node, &dmatest_channels);
+ 	nr_channels += 2;
+ 
+ 	if (iterations)
+ 		wait_event(thread_wait, !is_threaded_test_run(tx_dtc, rx_dtc));
+-
++	/*
++	 * Send signal to the user space process 
++	*/
++	// find the task with that pid
++	if(pid < 0){
++		pr_info("Pid was not initialized !");
++		return 0;
++	}
++	rcu_read_lock();
++	t = pid_task(find_pid_ns(pid, &init_pid_ns), PIDTYPE_PID);
++	if (t != NULL) {
++    rcu_read_unlock();      
++    if (send_sig_info(SIG_TEST, &info, t) < 0) {
++			pr_info("send_sig_info error\n");
++		}
++	} else {
++    	pr_info("pid_task error\n");
++    	rcu_read_unlock();
++    	return -ENODEV;
++	}
+ 	return 0;
+ }
+ 
++#define AXIDMA_FILE "file_axidma"
++#define AXIDMA_CLASS "class_axidma"
++#define AXIDMA_DEVICE "device_axidma"
+ static int xilinx_axidmatest_probe(struct platform_device *pdev)
+ {
+ 	struct dma_chan *chan, *rx_chan;
+ 	int err;
+-
++	pid = -1;
++	if(alloc_chrdev_region(&my_axidma_driver.dev, 0, 1,AXIDMA_FILE) < 0){
++			pr_info("Can not allocate major number\n");
++			return -1;
++	}
++	cdev_init(&my_axidma_driver.cdev,&axidma_fops);
++	cdev_add(&my_axidma_driver.cdev,my_axidma_driver.dev,1);
++	my_axidma_driver.class = class_create(THIS_MODULE,AXIDMA_CLASS);
++	if(IS_ERR(my_axidma_driver.class)) {
++		pr_info("Unsuccessfully create class !");
++		return -ENOMEM;
++	}
++	my_axidma_driver.device = device_create(my_axidma_driver.class,NULL,my_axidma_driver.dev,NULL,AXIDMA_DEVICE);
++	/*
++	 * Link the platform device to the axidma_driver entity.
++	*/
++	my_axidma_driver.container = &pdev->dev;
++	/*
++	Get the tx_channel created by dma platform driver xilinx_dma.c
++	*/
+ 	chan = dma_request_chan(&pdev->dev, "axidma0");
+ 	if (IS_ERR(chan)) {
+ 		err = PTR_ERR(chan);
+@@ -626,6 +815,9 @@ static int xilinx_axidmatest_probe(struct platform_device *pdev)
+ 		return err;
+ 	}
+ 
++	/*
++	Get the rx_channel created by dma platform driver xilinx_dma.c
++	*/
+ 	rx_chan = dma_request_chan(&pdev->dev, "axidma1");
+ 	if (IS_ERR(rx_chan)) {
+ 		err = PTR_ERR(rx_chan);
