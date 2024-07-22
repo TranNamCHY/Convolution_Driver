@@ -43,7 +43,7 @@ KERNEL_SYMS = $(KBUILD_DIR)/Module.symvers
 
 # The list of source files for the driver. Export the names to the Kbuild file.
 DRIVER_DIR = driver
-export AXIDMA_FILES = tempt.c
+export AXIDMA_FILES = tempt.c paremeter.h covid2.h conv2d.h max_pooling.h
 
 #DRIVER_PATHS = driver/tempt.c
 DRIVER_PATHS = $(addprefix $(DRIVER_DIR)/,$(AXIDMA_FILES))

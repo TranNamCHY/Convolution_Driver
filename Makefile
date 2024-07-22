@@ -34,12 +34,13 @@ OUTPUT_DIR ?= outputs
 .PHONY: all clean cross_compiler_check help
 
 # Compile the driver, library, and examples in release mode as the default
-all: driver
+all: driver app
 
 # Include the specific targets for the examples, library, and driver (the
 # includes must go here, so the default target is 'all')
 include driver/driver.mk
-
+app:
+	/home/nambcn/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-gcc -c app.c -o app
 # Make the specified output directory, if it doesn't exist
 $(OUTPUT_DIR):
 	@mkdir -p $(OUTPUT_DIR)

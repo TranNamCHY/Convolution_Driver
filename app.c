@@ -22,6 +22,7 @@ void handleFunction(int sig){
             printf("Got error: %s\n",strerror(errno));
             return;
     }
+    printf("Got: \n");
     for(i=0;i<length;i++){
         printf("%c",read_buffer[i]);
     }

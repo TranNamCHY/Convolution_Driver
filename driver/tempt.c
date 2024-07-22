@@ -15,6 +15,7 @@
 #include <linux/init.h>
 #include <linux/cdev.h>
 #include <linux/kthread.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
@@ -29,7 +30,10 @@
 #include <linux/sched/signal.h>
 #include <linux/string.h>
 #include <linux/list.h>
-
+#include "paremeter.h"
+#include "max_pooling.h"
+#include "covid2.h"
+#include "conv2d.h"
 static unsigned int test_buf_size = 16384;
 module_param(test_buf_size, uint, 0444);
 MODULE_PARM_DESC(test_buf_size, "Size of the memcpy test buffer");
@@ -530,9 +534,10 @@ static int test_my_dmatest_slave_func(void *data)
 			goto error;
 		}
 		/*
-		 * !!! Note: need to ensure the source_length divisible by 4.
+		 * !!! Note: No need to ensure the source_length divisible by 4 anymore
 		 */
-		len = (source_length >> align) << align;
+		//len = (source_length >> align) << align;
+		len = source_length;
 		dma_srcs = dma_map_single(tx_dev->dev,source_buffer,len,DMA_MEM_TO_DEV);
 		dma_dsts = dma_map_single(rx_dev->dev,dest_buffer,len,DMA_BIDIRECTIONAL);
 		
@@ -854,7 +859,6 @@ static int my_dmatest_add_slave_channels(struct dma_chan *tx_chan,
 	struct dmatest_chan *tx_dtc;
 	struct dmatest_chan *rx_dtc;
 	unsigned int thread_count = 0;
-
 	tx_dtc = kmalloc(sizeof(struct dmatest_chan), GFP_KERNEL);
 	if (!tx_dtc) {
 		pr_warn("dmatest: No memory for tx %s\n",
@@ -937,6 +941,8 @@ static int xilinx_axidmatest_probe(struct platform_device *pdev)
 	struct dma_chan *tx_chan, *rx_chan;
 	int chan_num = 0;
 	int err;
+	int ret;
+	unsigned long time_tempt;
 	pid = -1;
 	source_buffer = kmalloc(test_buf_size,GFP_KERNEL);
 	if(!source_buffer){
@@ -994,11 +1000,59 @@ static int xilinx_axidmatest_probe(struct platform_device *pdev)
 	pr_info("Find the rx dma_chan created by platform driver, address: %x\n",(unsigned int)rx_chan);
 	
 	err = my_dmatest_add_slave_channels(tx_chan, rx_chan,chan_num);
+	
 	if (err) {
 		pr_err("xilinx_dmatest: Unable to add channels\n");
 		goto free_rx;
 	}
+	/*
+	 * Init a test case for driver.
+	 */
+	
+	/*
+	source_length = 3123;
+	int i;
+	for(i=0;i<source_length;i++){
+		source_buffer[i] = i%128;
+	}
+	time_tempt = jiffies;
+	my_dmatest_add_slave_threads(0);
+	ret = wait_event_timeout(thread_wait,my_is_threaded_test_run(0),msecs_to_jiffies(5000));
+	if(ret == 0 ){
+		pr_info("Time out in file_write function");
+		return -1;
+	}
+	pr_info("It take: %d minitimes",jiffies_to_msecs(jiffies - time_tempt));
+	pr_info("Check value from dest_buffer: \n");
+	for(i=0;i<10;i++){
+		pr_info("%u\n",dest_buffer[i]);
+	}
+	pr_info("....\n");
+	pr_info("%u\n",dest_buffer[source_length-1])
+	for(i=0;i<source_leng;
+	pr_info("%u\n",dest_buffer[source_length]);
 
+
+	memset(dest_buffer,0,source_length);
+	time_tempt = jiffies;
+	my_dmatest_add_slave_threads(0);
+	ret = wait_event_timeout(thread_wait,my_is_threaded_test_run(0),msecs_to_jiffies(5000));
+	if(ret == 0 ){
+		pr_info("Time out in file_write function");
+		return -1;
+	}
+	pr_info("It take: %d minitimes",jiffies_to_msecs(jiffies - time_tempt));
+	pr_info("Check value from dest_buffer: \n");
+	for(i=0;i<10;i++){
+		pr_info("%u\n",dest_buffer[i]);
+	}
+	pr_info("....\n");
+	pr_info("%u\n",dest_buffer[source_length-1]);
+	pr_info("%u\n",dest_buffer[source_length]);
+	*/
+	/*
+	 *  End test case !.
+	 */
 	return 0;
 
 free_rx:
