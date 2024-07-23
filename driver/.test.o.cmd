@@ -1,0 +1,1 @@
+cmd_/home/nambcn/axidma/driver/test.o := /home/nambcn/petalinux/tools/xsct/gnu/aarch32/lin/gcc-arm-none-eabi/bin/arm-none-eabi-ld  -EL    -r -o /home/nambcn/axidma/driver/test.o /home/nambcn/axidma/driver/tempt.o

@@ -34,6 +34,7 @@
 #include "max_pooling.h"
 #include "covid2.h"
 #include "conv2d.h"
+#include "utility.h"
 static unsigned int test_buf_size = 16384;
 module_param(test_buf_size, uint, 0444);
 MODULE_PARM_DESC(test_buf_size, "Size of the memcpy test buffer");
@@ -51,6 +52,117 @@ static int pid = -1;
 #define SET_PID_CMD	_IOW(MAGIC_NO, 1, int)
 #define SIG_TEST 44
 
+/*
+ * Declare some struct variable for bare metal driver. 
+ */
+#define DMA_CONV_BASEADDR XPAR_AXI_DMA_0_BASEADDR
+#define CONV_BASE_ADDRESS XPAR_CONV_UNIT_0_S_AXI_BASEADDR
+#define DMA_MAXP_BASEADDR XPAR_AXI_DMA_1_BASEADDR
+#define MAX_POOLING_BASE_ADDRESS XPAR_MAX_POOLING_0_S_AXI_BASEADDR
+#define IMAGE_BUFF_BASEADDR XPAR_IMAGE_BUFFER_0_BASEADDR
+Con2D_Type Conv2D;
+Image_type Image_buf;
+void conv2d_initial_fixed_paras(void) {
+    uint32_t data = 0;
+	int timeout = 2000;
+	uint32_t offset =  offsetof(Con2D_Type,Status);
+	if(Conv2D.BaseAddress ==  NULL){
+		pr_info("Detect NULL address of BaseAddress at line: %d\n",__LINE__);
+		return ;
+	}
+    //Con2D->IAddr = 0;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,IAddr)-offset,0,0xFFFFFFFF,timeout,__LINE__);
+
+    /*
+     * Note: No need to turn on and off between times we put the parameter in Address_and_Coeff
+     * Because both the weight and address be transmitted at the same time
+     */
+    //Con2D->Control |= C_WE_IN;  // allow write to weight
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,C_WE_IN,1u << 1,timeout,__LINE__);
+
+    data = 0;
+    data |= K_ADDR;
+    data |= K << COEFF_IN_LOW;
+    //Con2D->Address_and_Coeff = data;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Address_and_Coeff)-offset,data,0xFFFFFFFF,timeout,__LINE__);
+
+    data = 0;
+    data |= K2_MINUS1_ADDR;
+    data |= K2_MINUS1 << COEFF_IN_LOW;
+    //Con2D->Address_and_Coeff = data;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Address_and_Coeff)-offset,data,0xFFFFFFFF,timeout,__LINE__);
+
+    data = 0;
+    data |= K2_MINUSK_ADDR;
+    data |= K2_MINUSK << COEFF_IN_LOW;
+    //Con2D->Address_and_Coeff = data;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Address_and_Coeff)-offset,data,0xFFFFFFFF,timeout,__LINE__);
+
+	//Con2D->Control &= ~C_WE_IN;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,0u << 1,1u << 1,timeout,__LINE__);
+
+}
+
+void image_buffer_reset(void) {
+	uint32_t offset;
+	int timeout;
+	offset =  offsetof(Image_type,Reset);
+	timeout = 2000;
+	//Image_buf->Reset = 0;
+	write_and_check_register(Image_buf.BaseAddress,offsetof(Image_type,Reset)-offset,0u,0xFFFFFFFF,timeout,__LINE__);
+	//Image_buf->Reset |= IMAGE_BUFF_RESET;
+	write_and_check_register(Image_buf.BaseAddress,offsetof(Image_type,Reset)-offset,IMAGE_BUFF_RESET,1u << 0,timeout,__LINE__);
+}
+
+void conv2d_change_weight(uint8_t* weight) {
+	int timeout = 2000;
+	uint8_t i;
+	uint32_t offset =  offsetof(Con2D_Type,Status);
+    //Con2D->Control |= C_WE_IN;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,C_WE_IN,1u << 1,timeout,__LINE__);
+    for (i = 0; i <= K2_MINUS1; i++) {
+        uint32_t data = 0;
+        data |= (WEIGHT_STR_ADDR + i);
+        data |= weight[i] << COEFF_IN_LOW;
+        //Con2D->Address_and_Coeff = data;
+		write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Address_and_Coeff)-offset,data,0xFFFFFFFF,timeout,__LINE__);
+    }
+    //Con2D->Control &= ~C_WE_IN;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,0u << 1,1u << 1,timeout,__LINE__);
+}
+
+void conv2d_start(void) {
+	int timeout = 2000;
+	uint32_t offset =  offsetof(Con2D_Type,Status);
+    // Enable InputDmac & Convolution
+    //Con2D->Control |= INPUTDMAC_START;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,INPUTDMAC_START,1u << 2,timeout,__LINE__);
+    //Con2D->Control |= CONV2D_START;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,CONV2D_START,1u << 3,timeout,__LINE__);
+    //Con2D->Control &= ~INPUTDMAC_START;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,0u << 2,1u << 2,timeout,__LINE__);
+	//Con2D->Control &= ~CONV2D_START;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,0u << 3,1u << 3,timeout,__LINE__);
+}
+
+void conv2d_change_size_paras(con2d_size_paras paras) {
+	if(Conv2D.BaseAddress ==  NULL){
+		pr_info("Detect NULL address of BaseAddress at line: %d\n",__LINE__);
+		return ;
+	}
+	int timeout = 2000;
+    uint32_t data = 0;
+	uint32_t offset =  offsetof(Con2D_Type,Status);
+    // set BCR register
+    data |= paras.B;
+    data |= paras.C << C_LOW;
+    data |= paras.R << R_LOW;
+    //Con2D->BCR = data;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,BCR)-offset,data,0xFFFFFFFF,timeout,__LINE__);
+    // set M^2 - 1
+    //Con2D->M2minus1 = paras.M2minus1;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,M2minus1)-offset,paras.M2minus1,0xFFFFFFFF,timeout,__LINE__);
+}
 /*
  * Ops file function for user space to interact with 
  * character device file.
@@ -1004,6 +1116,18 @@ static int xilinx_axidmatest_probe(struct platform_device *pdev)
 	if (err) {
 		pr_err("xilinx_dmatest: Unable to add channels\n");
 		goto free_rx;
+	}
+	Conv2D.BaseAddress = NULL;
+	Conv2D.BaseAddress = (void*)ioremap(CONV_BASE_ADDRESS,100);
+	if(Conv2D.BaseAddress == NULL){
+		pr_info("Error with ioremap func at line: %d\n",__LINE__);
+		return -1;
+	}
+	Image_buf.BaseAddress = NULL;
+	Image_buf.BaseAddress = (void*)ioremap(IMAGE_BUFF_BASEADDR,100);
+	if(Image_buf.BaseAddress == NULL){
+		pr_info("Error with ioremap func at line: %d\n",__LINE__);
+		return -1;
 	}
 	/*
 	 * Init a test case for driver.

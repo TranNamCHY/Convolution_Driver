@@ -57,7 +57,8 @@
     Remaining        : write register
 */
 typedef struct Con2D_Type {
-    uint32_t Status;
+    void* __iomem BaseAddress;
+    uint32_t Status; // This is the actual base address
     uint32_t Control;
     uint32_t Address_and_Coeff;
     uint32_t BCR;
@@ -71,5 +72,10 @@ typedef struct con2d_size_paras {
     uint16_t R;
     uint16_t M2minus1;
 } con2d_size_paras;
+
+typedef struct Image_type {
+    void* __iomem BaseAddress;
+	uint32_t Reset;
+}Image_type;
 
 #endif /* SRC_CONV2D_H_ */
