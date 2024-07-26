@@ -57,13 +57,13 @@
     Remaining        : write register
 */
 typedef struct Con2D_Type {
-    void* __iomem BaseAddress;
-    uint32_t Status; // This is the actual base address
-    uint32_t Control;
-    uint32_t Address_and_Coeff;
-    uint32_t BCR;
-    uint32_t M2minus1;
-    uint32_t IAddr;
+    void* __iomem BaseAddress; // offset 0
+    uint32_t Status; // This is the actual base address, offset 4
+    uint32_t Control; //offset 8
+    uint32_t Address_and_Coeff; // offset 12
+    uint32_t BCR; // offset 16
+    uint32_t M2minus1; // offset 20 
+    uint32_t IAddr; // offset 24
 } Con2D_Type;
 
 typedef struct con2d_size_paras {

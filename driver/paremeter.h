@@ -78,5 +78,5 @@
 /* Definitions for peripheral IMAGE_BUFFER_0 */
 #define XPAR_IMAGE_BUFFER_0_BASEADDR 0x43C20000
 #define XPAR_IMAGE_BUFFER_0_HIGHADDR 0x43C2FFFF
-#define IMAGE_BUFF_RESET (1<<0)
+#define IMAGE_BUFF_RESET (1u << 0)
 #endif /* AXIDMA_H_ */

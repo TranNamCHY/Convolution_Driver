@@ -114,6 +114,17 @@ void image_buffer_reset(void) {
 	write_and_check_register(Image_buf.BaseAddress,offsetof(Image_type,Reset)-offset,IMAGE_BUFF_RESET,1u << 0,timeout,__LINE__);
 }
 
+void conv2d_reset(void) {
+	int timeout = 2000;
+	uint32_t offset =  offsetof(Con2D_Type,Status);
+    // reset all control paras
+    //Con2D->Control = 0;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,0,0xFFFFFFFF,timeout,__LINE__);
+    // Then turn on reset bit (negative reset occurs at previous command)
+    //Con2D->Control |= RESET;
+	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,1u << 0,RESET,timeout,__LINE__);
+}
+
 void conv2d_change_weight(uint8_t* weight) {
 	int timeout = 2000;
 	uint8_t i;
@@ -651,7 +662,7 @@ static int test_my_dmatest_slave_func(void *data)
 		//len = (source_length >> align) << align;
 		len = source_length;
 		dma_srcs = dma_map_single(tx_dev->dev,source_buffer,len,DMA_MEM_TO_DEV);
-		dma_dsts = dma_map_single(rx_dev->dev,dest_buffer,len,DMA_BIDIRECTIONAL);
+		dma_dsts = dma_map_single(rx_dev->dev,dest_buffer,test_buf_size,DMA_BIDIRECTIONAL);
 		
 		sg_init_table(tx_sg,1);
 		sg_init_table(rx_sg,1);
@@ -660,8 +671,9 @@ static int test_my_dmatest_slave_func(void *data)
 		sg_dma_address(&rx_sg[0]) = dma_dsts;
 		 
 		sg_dma_len(&tx_sg[0]) = len;
-		sg_dma_len(&rx_sg[0]) = len;
+		sg_dma_len(&rx_sg[0]) = test_buf_size;
 		pr_info("Len: %d\n",len);
+		pr_info("Dest_length: %d\n",test_buf_size);
 		rxd = rx_dev->device_prep_slave_sg(rx_chan,rx_sg,1,DMA_DEV_TO_MEM,flags,NULL);
 		txd = tx_dev->device_prep_slave_sg(tx_chan,tx_sg,1,DMA_MEM_TO_DEV,flags,NULL);
 		
@@ -739,7 +751,7 @@ static int test_my_dmatest_slave_func(void *data)
      * Notify for the dmatest_add_slave_channels that the thread has finished.
      */
 	dma_unmap_single(tx_dev->dev,dma_srcs,len,DMA_MEM_TO_DEV);
-	dma_unmap_single(rx_dev->dev,dma_dsts,len,DMA_BIDIRECTIONAL);
+	dma_unmap_single(rx_dev->dev,dma_dsts,test_buf_size,DMA_BIDIRECTIONAL);
 	wake_up(&thread_wait);
 	if(pid < 0){
 		pr_info("Pid was not initialized !");
@@ -1129,51 +1141,51 @@ static int xilinx_axidmatest_probe(struct platform_device *pdev)
 		pr_info("Error with ioremap func at line: %d\n",__LINE__);
 		return -1;
 	}
+	conv2d_initial_fixed_paras();
+
 	/*
 	 * Init a test case for driver.
 	 */
-	
-	/*
-	source_length = 3123;
+
+	uint16_t input_height = 20;
+	uint16_t input_width = 20;
+	uint8_t weight_vector[] = {0,1,2,3,4,5,6,7,8};
+	source_length = input_width*input_height;
 	int i;
 	for(i=0;i<source_length;i++){
-		source_buffer[i] = i%128;
+		source_buffer[i] = i%255;
 	}
+	con2d_size_paras default_paras;
+	/*
+	 * Set up paramerter for conv module.
+ 	 */
+	default_paras.B = input_height - 2;
+	default_paras.C = input_width;
+	default_paras.R = 3;
+	default_paras.M2minus1 = (input_width - 2)*(input_height - 2) -1;
+	conv2d_change_size_paras(default_paras);
+	conv2d_reset();
+	image_buffer_reset();
+	conv2d_change_weight(weight_vector);
+	conv2d_start();
+	// Start the dma transfer.
+
+	/*
+	 * Need change the size of dest buffer.
+ 	 */
+	/* dest_length = (input_width - 2) * (input_height - 2)*4;
 	time_tempt = jiffies;
 	my_dmatest_add_slave_threads(0);
 	ret = wait_event_timeout(thread_wait,my_is_threaded_test_run(0),msecs_to_jiffies(5000));
 	if(ret == 0 ){
 		pr_info("Time out in file_write function");
-		return -1;
+		//return -1;
 	}
-	pr_info("It take: %d minitimes",jiffies_to_msecs(jiffies - time_tempt));
+	//pr_info("It take: %d minitimes",jiffies_to_msecs(jiffies - time_tempt));
 	pr_info("Check value from dest_buffer: \n");
 	for(i=0;i<10;i++){
 		pr_info("%u\n",dest_buffer[i]);
-	}
-	pr_info("....\n");
-	pr_info("%u\n",dest_buffer[source_length-1])
-	for(i=0;i<source_leng;
-	pr_info("%u\n",dest_buffer[source_length]);
-
-
-	memset(dest_buffer,0,source_length);
-	time_tempt = jiffies;
-	my_dmatest_add_slave_threads(0);
-	ret = wait_event_timeout(thread_wait,my_is_threaded_test_run(0),msecs_to_jiffies(5000));
-	if(ret == 0 ){
-		pr_info("Time out in file_write function");
-		return -1;
-	}
-	pr_info("It take: %d minitimes",jiffies_to_msecs(jiffies - time_tempt));
-	pr_info("Check value from dest_buffer: \n");
-	for(i=0;i<10;i++){
-		pr_info("%u\n",dest_buffer[i]);
-	}
-	pr_info("....\n");
-	pr_info("%u\n",dest_buffer[source_length-1]);
-	pr_info("%u\n",dest_buffer[source_length]);
-	*/
+	} */
 	/*
 	 *  End test case !.
 	 */
@@ -1216,6 +1228,12 @@ static int xilinx_axidmatest_remove(struct platform_device *pdev)
 	}
 	kfree(source_buffer);
 	kfree(dest_buffer);
+	if(Conv2D.BaseAddress != NULL){
+		iounmap(Conv2D.BaseAddress);
+	}
+	if(Image_buf.BaseAddress != NULL){
+		iounmap(Image_buf.BaseAddress);
+	}
 	return 0;
 }
 
