@@ -78,4 +78,12 @@ typedef struct Image_type {
 	uint32_t Reset;
 }Image_type;
 
+ 
+typedef struct Fifo_type { 
+    void* __iomem BaseAddress; // 0
+    uint32_t Threshold; // 4
+    uint32_t Counter; // 8
+    uint32_t Reset; // 12
+} Fifo_type;
+
 #endif /* SRC_CONV2D_H_ */

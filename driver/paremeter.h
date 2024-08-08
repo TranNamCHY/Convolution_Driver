@@ -80,3 +80,9 @@
 #define XPAR_IMAGE_BUFFER_0_HIGHADDR 0x43C2FFFF
 #define IMAGE_BUFF_RESET (1u << 0)
 #endif /* AXIDMA_H_ */
+
+
+/******************************************************************/
+
+/* Definitions for peripheral MY_AXI_FIFO */
+#define AXI_FIFO_BASEADDR 0x43C30000
