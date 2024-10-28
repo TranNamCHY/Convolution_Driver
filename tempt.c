@@ -42,6 +42,7 @@ MODULE_PARM_DESC(iterations,
 char config_data[1024];
 struct kernel_siginfo info;
 struct task_struct *t;
+
 static int pid = -1;
 #define MAGIC_NO	100
 #define SET_PID_CMD	_IOW(MAGIC_NO, 1, int)

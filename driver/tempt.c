@@ -36,7 +36,32 @@
 #include "covid2.h"
 #include "conv2d.h"
 #include "utility.h"
-#define MAX_DEST_BUFFER 200000
+#include <linux/mm.h>
+#include <linux/ktime.h>
+#include <linux/timekeeping.h>
+/*
+ * This define was used to create character file.
+*/
+
+#define AXIDMA_FILE "file_axidma"
+#define AXIDMA_CLASS "class_axidma"
+#define AXIDMA_DEVICE "device_axidma"
+
+/*
+ * This structure was used to create character file.
+*/
+struct axidma_driver {
+	struct class* class;
+	struct device* device;
+	dev_t dev;
+	struct cdev cdev;
+	struct device* container;
+};
+
+struct axidma_driver my_axidma_driver;
+#define MAX_DEST_BUFFER 4 * 100 * 100
+#define MAX_SRC_BUFFER 100 * 100
+#define KERNEL_LEN 3 * 3
 static unsigned int test_buf_size = MAX_DEST_BUFFER;
 module_param(test_buf_size, uint, 0444);
 MODULE_PARM_DESC(test_buf_size, "Size of the memcpy test buffer");
@@ -46,12 +71,46 @@ module_param(iterations, uint, 0444);
 MODULE_PARM_DESC(iterations,
 		 "Iterations before stopping test (default: infinite)");
 
+/*
+ * Used to sending interrupt for the userspace application.
+*/
 char config_data[1024];
 struct kernel_siginfo info;
 struct task_struct *t;
 static int pid = -1;
+int sig_num = -1;
+unsigned int pre_cmd;
+uint16_t image_width;
+uint16_t image_height;
+/*
+ * Buffer and dma_address used for dma operation.
+*/
+struct dma_memory {
+	void* kernel_buffer; 
+	dma_addr_t dma_address;
+	int size;
+};
+void* coherent_source_buffer; 
+void* coherent_dest_buffer;
+void* weight;
+struct page* page_weight;
+dma_addr_t mapped_source_buffer;
+dma_addr_t mapped_dest_buffer;
+struct dma_chan *force_tx_chan;
+struct dma_chan *force_rx_chan;
+
+/*
+ * Macro used for usespace application
+*/
+unsigned int pre_cmd;
 #define MAGIC_NO	100
 #define SET_PID_CMD	_IOW(MAGIC_NO, 1, int)
+#define PRE_SRC_BUFF _IOW(MAGIC_NO, 2, int)
+#define PRE_KERNEL_BUFF _IOW(MAGIC_NO, 3, int)
+#define PRE_DEST_BUFF _IOW(MAGIC_NO, 4, int)
+#define SET_IMAGE_HEIGHT_WIDTH _IOW(MAGIC_NO, 5, int)
+#define START_CACULATE _IOW(MAGIC_NO, 6, int)
+#define FORCE_START_CACULATE _IOW(MAGIC_NO, 7, int)
 #define SIG_TEST 44
 
 /*
@@ -63,13 +122,74 @@ static int pid = -1;
 #define MAX_POOLING_BASE_ADDRESS XPAR_MAX_POOLING_0_S_AXI_BASEADDR
 #define IMAGE_BUFF_BASEADDR XPAR_IMAGE_BUFFER_0_BASEADDR
 #define MY_AXI_FIFO_BASEADDR AXI_FIFO_BASEADDR
+
+/*
+ * Data structure for Baremetal module.
+*/
 Con2D_Type Conv2D;
 Image_type Image_buf;
 Fifo_type Axi_Fifo;
+
+/*
+ * This two buffer was used in single dma map api
+*/
+
+
+/*
+ * Initialization patterns. All bytes in the source buffer has bit 7
+ * set, all bytes in the destination buffer has bit 7 cleared.
+ *
+ * Bit 6 is set for all bytes which are to be copied by the DMA
+ * engine. Bit 5 is set for all bytes which are to be overwritten by
+ * the DMA engine.
+ *
+ * The remaining bits are the inverse of a counter which increments by
+ * one for each byte address.
+ */
+
+#define PATTERN_SRC		0x80
+#define PATTERN_DST		0x00
+#define PATTERN_COPY		0x40
+#define PATTERN_OVERWRITE	0x20
+#define PATTERN_COUNT_MASK	0x1f
+
+#define XILINX_DMATEST_BD_CNT	11
+
+struct dmatest_slave_thread {
+	struct list_head node; // To store the entity to the list_head threads of dmatest_chan entity
+	struct task_struct *task;
+	struct dma_chan *tx_chan;
+	struct dma_chan *rx_chan;
+	u8 **srcs;
+	u8 **dsts;
+	enum dma_transaction_type type;
+	bool done;
+};
+
+struct dmatest_chan {
+	struct list_head node; // This node to add each dmatest_chan entity to the list_headd dmatest_channels.
+	struct dma_chan *chan; 
+	struct list_head threads; // This list_head store threads created to do the trasnfer request for a dmatest_channels.
+	int chan_num;
+	int thread_num;
+	char name[20];
+};
+
+/*
+ * These are protected by dma_list_mutex since they're only used by
+ * the DMA filter function callback
+ */
+static DECLARE_WAIT_QUEUE_HEAD(thread_wait);
+static LIST_HEAD(dmatest_channels);
+static unsigned int nr_channels;
+/*
+ * Reset the operation of axi fifo module
+*/
 void fifo_init_reset(uint32_t threshold){
-	uint32_t data = 0;
 	int timeout = 2000;
-	uint32_t offset = offsetof(Fifo_type,Threshold);
+	unsigned long mark_time;
+	uint32_t offset;
+	offset = offsetof(Fifo_type,Threshold);
 	if(Axi_Fifo.BaseAddress  == NULL){
 		pr_info("Detect NULL address of BaseAddress at line: %d\n",__LINE__);
 		return ;
@@ -77,21 +197,30 @@ void fifo_init_reset(uint32_t threshold){
 	// Reset fifo, set reset register = 1 and check if counter been set to 0.
 	write_and_check_register(Axi_Fifo.BaseAddress,offsetof(Fifo_type,Reset)-offset,1u << 0,1u << 0,timeout,__LINE__);
     // Check the counter register has been reset.
-	unsigned long mark_time = jiffies;
+	mark_time = jiffies;
 	while(((jiffies_to_msecs(jiffies - mark_time)) < timeout) && (read_register(Axi_Fifo.BaseAddress,offsetof(Fifo_type,Counter)-offset) != 0)){}
 	// Disable Reset 
 	write_and_check_register(Axi_Fifo.BaseAddress,offsetof(Fifo_type,Reset)-offset,0,1u << 0,timeout,__LINE__);
 	// Write to threshold register
 	write_and_check_register(Axi_Fifo.BaseAddress,offsetof(Fifo_type,Threshold) - offset, threshold, 0xFFFFFFFF, timeout, __LINE__);
 }
+
+/* 
+ * Get the counter value from counter register of axi fifo module.
+*/
 uint32_t get_counter(void){
 	uint32_t offset = offsetof(Fifo_type,Threshold);
 	return read_register(Axi_Fifo.BaseAddress,offsetof(Fifo_type,Counter) - offset);
 }
+
+/*
+ * Get the threshold value from threshold registere of axi fifo module.
+*/
 uint32_t get_threshold(void){
 	uint32_t offset = offsetof(Fifo_type,Threshold);
 	return read_register(Axi_Fifo.BaseAddress,offsetof(Fifo_type,Threshold) - offset);
 }
+
 void conv2d_initial_fixed_paras(void) {
     uint32_t data = 0;
 	int timeout = 2000;
@@ -155,10 +284,14 @@ void conv2d_reset(void) {
 	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,1u << 0,RESET,timeout,__LINE__);
 }
 
-void conv2d_change_weight(uint8_t* weight) {
+void conv2d_change_weight(int8_t* weight) {
 	int timeout = 2000;
 	uint8_t i;
 	uint32_t offset =  offsetof(Con2D_Type,Status);
+	if(weight == NULL){
+		pr_info("Weight buffer has not been initialized");
+		return;
+	}
     //Con2D->Control |= C_WE_IN;
 	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,Control)-offset,C_WE_IN,1u << 1,timeout,__LINE__);
     for (i = 0; i <= K2_MINUS1; i++) {
@@ -187,13 +320,16 @@ void conv2d_start(void) {
 }
 
 void conv2d_change_size_paras(con2d_size_paras paras) {
+	int timeout;
+    uint32_t data;
+	uint32_t offset;
+	offset = offsetof(Con2D_Type,Status);
 	if(Conv2D.BaseAddress ==  NULL){
 		pr_info("Detect NULL address of BaseAddress at line: %d\n",__LINE__);
 		return ;
 	}
-	int timeout = 2000;
-    uint32_t data = 0;
-	uint32_t offset =  offsetof(Con2D_Type,Status);
+	data = 0;
+	timeout = 2000;
     // set BCR register
     data |= paras.B;
     data |= paras.C << C_LOW;
@@ -204,110 +340,32 @@ void conv2d_change_size_paras(con2d_size_paras paras) {
     //Con2D->M2minus1 = paras.M2minus1;
 	write_and_check_register(Conv2D.BaseAddress,offsetof(Con2D_Type,M2minus1)-offset,paras.M2minus1,0xFFFFFFFF,timeout,__LINE__);
 }
+
 /*
  * Ops file function for user space to interact with 
  * character device file.
  */
-
 static int file_open (struct inode * inode, struct file *file);
 static int file_release (struct inode * inode, struct file *file);
 static ssize_t file_write (struct file * file, const char __user * buff, size_t length, loff_t * loff_of);
 static ssize_t file_read (struct file * file,char __user * buff, size_t length, loff_t * loff_of);
 static long file_ioctl(struct file *filep, unsigned int cmd, unsigned long arg);
-
- struct file_operations axidma_fops = {
+static int file_mmap(struct file *file, struct vm_area_struct *vma);
+static void axidma_vma_close(struct vm_area_struct *vma);
+struct file_operations axidma_fops = {
 	.owner      = THIS_MODULE,
     .read       = file_read,
     .write      = file_write,
     .open       = file_open,
     .release    = file_release,
 	.unlocked_ioctl  = file_ioctl,
+	.mmap = file_mmap,
 };
 
-u8* source_buffer;
-u32* dest_buffer;
-int source_length;
-int dest_length;
-struct axidma_driver {
-	struct class* class;
-	struct device* device;
-	dev_t dev;
-	struct cdev cdev;
-	struct device* container;
+// The VMA operations for the AXI DMA device
+static const struct vm_operations_struct axidma_vm_ops = {
+    .close = axidma_vma_close,
 };
-
-struct axidma_driver my_axidma_driver;
-
-/*
- * Initialization patterns. All bytes in the source buffer has bit 7
- * set, all bytes in the destination buffer has bit 7 cleared.
- *
- * Bit 6 is set for all bytes which are to be copied by the DMA
- * engine. Bit 5 is set for all bytes which are to be overwritten by
- * the DMA engine.
- *
- * The remaining bits are the inverse of a counter which increments by
- * one for each byte address.
- */
-
-#define PATTERN_SRC		0x80
-#define PATTERN_DST		0x00
-#define PATTERN_COPY		0x40
-#define PATTERN_OVERWRITE	0x20
-#define PATTERN_COUNT_MASK	0x1f
-
-#define XILINX_DMATEST_BD_CNT	11
-
-struct dmatest_slave_thread {
-	struct list_head node; // To store the entity to the list_head threads of dmatest_chan entity
-	struct task_struct *task;
-	struct dma_chan *tx_chan;
-	struct dma_chan *rx_chan;
-	u8 **srcs;
-	u8 **dsts;
-	enum dma_transaction_type type;
-	bool done;
-};
-
-struct dmatest_chan {
-	struct list_head node; // This node to add each dmatest_chan entity to the list_headd dmatest_channels.
-	struct dma_chan *chan; 
-	struct list_head threads; // This list_head store threads created to do the trasnfer request for a dmatest_channels.
-	int chan_num;
-	int thread_num;
-	char name[20];
-};
-
-/*
- * These are protected by dma_list_mutex since they're only used by
- * the DMA filter function callback
- */
-static DECLARE_WAIT_QUEUE_HEAD(thread_wait);
-static LIST_HEAD(dmatest_channels);
-static unsigned int nr_channels;
-
-static unsigned long long dmatest_persec(s64 runtime, unsigned int val)
-{
-	unsigned long long per_sec = 1000000;
-
-	if (runtime <= 0)
-		return 0;
-
-	/* drop precision until runtime is 32-bits */
-	while (runtime > UINT_MAX) {
-		runtime >>= 1;
-		per_sec <<= 1;
-	}
-
-	per_sec *= val;
-	do_div(per_sec, runtime);
-	return per_sec;
-}
-
-static unsigned long long dmatest_KBs(s64 runtime, unsigned long long len)
-{
-	return dmatest_persec(runtime, len >> 10);
-}
 
 static bool is_threaded_test_run(struct dmatest_chan *tx_dtc,
 				 struct dmatest_chan *rx_dtc)
@@ -359,101 +417,6 @@ static bool my_is_threaded_test_run(int chan_num)
 	return true;
 }
 
-static unsigned long dmatest_random(void)
-{
-	unsigned long buf;
-
-	get_random_bytes(&buf, sizeof(buf));
-	return buf;
-}
-
-static void dmatest_init_srcs(u8 **bufs, unsigned int start, unsigned int len)
-{
-	unsigned int i;
-	u8 *buf;
-
-	for (; (buf = *bufs); bufs++) {
-		for (i = 0; i < start; i++)
-			buf[i] = PATTERN_SRC | (~i & PATTERN_COUNT_MASK);
-		for ( ; i < start + len; i++)
-			buf[i] = PATTERN_SRC | PATTERN_COPY
-				| (~i & PATTERN_COUNT_MASK);
-		for ( ; i < test_buf_size; i++)
-			buf[i] = PATTERN_SRC | (~i & PATTERN_COUNT_MASK);
-	}
-}
-
-static void dmatest_init_dsts(u8 **bufs, unsigned int start, unsigned int len)
-{
-	unsigned int i;
-	u8 *buf;
-
-	for (; (buf = *bufs); bufs++) {
-		for (i = 0; i < start; i++)
-			buf[i] = PATTERN_DST | (~i & PATTERN_COUNT_MASK);
-		for ( ; i < start + len; i++)
-			buf[i] = PATTERN_DST | PATTERN_OVERWRITE
-				| (~i & PATTERN_COUNT_MASK);
-		for ( ; i < test_buf_size; i++)
-			buf[i] = PATTERN_DST | (~i & PATTERN_COUNT_MASK);
-	}
-}
-
-static void dmatest_mismatch(u8 actual, u8 pattern, unsigned int index,
-			     unsigned int counter, bool is_srcbuf)
-{
-	u8 diff = actual ^ pattern;
-	u8 expected = pattern | (~counter & PATTERN_COUNT_MASK);
-	const char *thread_name = current->comm;
-
-	if (is_srcbuf)
-		pr_warn("%s: srcbuf[0x%x] overwritten! Expected %02x, got %02x\n",
-			thread_name, index, expected, actual);
-	else if ((pattern & PATTERN_COPY) &&
-		 (diff & (PATTERN_COPY | PATTERN_OVERWRITE)))
-		pr_warn("%s: dstbuf[0x%x] not copied! Expected %02x, got %02x\n",
-			thread_name, index, expected, actual);
-	else if (diff & PATTERN_SRC)
-		pr_warn("%s: dstbuf[0x%x] was copied! Expected %02x, got %02x\n",
-			thread_name, index, expected, actual);
-	else
-		pr_warn("%s: dstbuf[0x%x] mismatch! Expected %02x, got %02x\n",
-			thread_name, index, expected, actual);
-}
-
-static unsigned int dmatest_verify(u8 **bufs, unsigned int start,
-				   unsigned int end, unsigned int counter,
-				   u8 pattern, bool is_srcbuf)
-{
-	unsigned int i;
-	unsigned int error_count = 0;
-	u8 actual;
-	u8 expected;
-	u8 *buf;
-	unsigned int counter_orig = counter;
-
-	for (; (buf = *bufs); bufs++) {
-		counter = counter_orig;
-		for (i = start; i < end; i++) {
-			actual = buf[i];
-			expected = pattern | (~counter & PATTERN_COUNT_MASK);
-			if (actual != expected) {
-				if (error_count < 32)
-					dmatest_mismatch(actual, pattern, i,
-							 counter, is_srcbuf);
-				error_count++;
-			}
-			counter++;
-		}
-	}
-
-	if (error_count > 32)
-		pr_warn("%s: %u errors suppressed\n",
-			current->comm, error_count - 32);
-
-	return error_count;
-}
-
 static void dmatest_slave_tx_callback(void *completion)
 {
 	//dump_stack();
@@ -466,216 +429,70 @@ static void dmatest_slave_rx_callback(void *completion)
 	complete(completion);
 }
 
-static int my_dmatest_slave_func(void *data)
+static int force_coherent_test_my_dmatest_slave_func(void)
 {
-	struct dmatest_slave_thread	*thread = data;
-	struct dma_chan *tx_chan;
-	struct dma_chan *rx_chan;
+	//unsigned long mark_time = jiffies;
+	struct dma_chan *tx_chan = force_tx_chan;
+	struct dma_chan *rx_chan = force_rx_chan;
 	const char *thread_name;
-	unsigned int total_tests = 0;
 	dma_cookie_t tx_cookie;
 	dma_cookie_t rx_cookie;
 	enum dma_status status;
 	enum dma_ctrl_flags flags;
-	int ret;
-	int i;
-	thread_name = current->comm;
-	ret = -ENOMEM;
-
+	int ret = 0;
+	struct dma_device *tx_dev = tx_chan->device;
+	struct dma_device *rx_dev = rx_chan->device;
+	struct dma_async_tx_descriptor *txd = NULL;
+	struct dma_async_tx_descriptor *rxd = NULL;
+	struct completion rx_cmp;
+	struct completion tx_cmp;
+	con2d_size_paras default_paras;
+	unsigned long rx_tmo = msecs_to_jiffies(5000); /* RX takes longer */
+	unsigned long tx_tmo = msecs_to_jiffies(5000);
+	u8 align = 0;
+	struct scatterlist tx_sg[1];
+	struct scatterlist rx_sg[1];
+	//thread_name = current->comm;
+	/* pr_info("Kernel filter: ");
+	for(i = 0; i < 3; i++){
+		printk(KERN_INFO "[ ");
+		for(j = 0; j < 3; j++){
+			printk(KERN_CONT  "%d ", tempt_kernel_buffer[i*3 + j]);
+		}
+		printk(KERN_CONT "]\n");
+	}
+	pr_info("Source buffer:");
+	for(i = 0; i < image_height; i++){
+		printk(KERN_INFO "[ ");
+		for(j = 0; j < image_width; j++){
+			printk(KERN_CONT  "%d ", tempt_source_buffer[i * image_height + j]);
+		}
+		printk(KERN_CONT "]\n");
+	} */
 	/* Ensure that all previous reads are complete */
 	smp_rmb();
-	tx_chan = thread->tx_chan;
-	rx_chan = thread->rx_chan;
-	/* 
-	 * Set nice value (Ptest_my_dmatest_slave_funcriority) of this thread to 10.
-	 */
-	set_user_nice(current, 10);
-
-	flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
-		/*
-		 * Get the dma_device from tx_chan and rx_chan got from dmatest_add_slave_threads
-		 */
-		struct dma_device *tx_dev = tx_chan->device;
-		struct dma_device *rx_dev = rx_chan->device;
-		struct dma_async_tx_descriptor *txd = NULL;
-		struct dma_async_tx_descriptor *rxd = NULL;
-        dma_addr_t dma_srcs;
-		dma_addr_t dma_dsts;
-		struct completion rx_cmp;
-		struct completion tx_cmp;
-		unsigned long rx_tmo = msecs_to_jiffies(1000); /* RX takes longer */
-		unsigned long tx_tmo = msecs_to_jiffies(1000);
-		u8 align = 0;
-		struct scatterlist tx_sg[1];
-		struct scatterlist rx_sg[1];
-		/* honor larger alignment restrictions */
-		align = tx_dev->copy_align;
-		if (rx_dev->copy_align > align)
-			align = rx_dev->copy_align;
-
-		if ((1 << align) > test_buf_size) {
-			pr_err("%u-byte buffer too small for %d-byte alignment\n",
-			       test_buf_size, 1 << align);
-		}
-
-		/*
-		 * Init a test case.
-		 */
-		for(i=0;i<4096;i++){
-            source_buffer[i] =  i%255;
-        }
-		/*
-		 * Physic address of source buffer.
-		 */
-		dma_srcs = dma_map_single(tx_dev->dev, 
-							 source_buffer, 
-							 test_buf_size,
-						     DMA_MEM_TO_DEV);
-
-		/*
-		 * Physic address of destination buffer.
-		 */	
-        dma_dsts = dma_map_single(rx_dev->dev,
-						     dest_buffer,
-						     test_buf_size,
-						     DMA_BIDIRECTIONAL);
-		/*
-		 * Init the scatter gather list with 11 elenment 
-		 */
-		sg_init_table(tx_sg, 1);
-		sg_init_table(rx_sg, 1);
-		sg_dma_address(&tx_sg[0]) = dma_srcs;
-		sg_dma_address(&rx_sg[0]) = dma_dsts;
-
-		/*
-		 * Init the transfer length for tx and rx channel
-		 */
-		sg_dma_len(&tx_sg[0]) = 3600;
-		sg_dma_len(&rx_sg[0]) = 3600;
-
-		rxd = rx_dev->device_prep_slave_sg(rx_chan, rx_sg, 1,
-				DMA_DEV_TO_MEM, flags, NULL);
-
-		txd = tx_dev->device_prep_slave_sg(tx_chan, tx_sg, 1,
-				DMA_MEM_TO_DEV, flags, NULL);
-
-		if (!rxd || !txd) {
-			pr_info("Error with device_prep_slave_sg at line: %d\n",__LINE__);
-			ret = -1;
-			goto error;
-		}
-
-		/*
-		 * Init rx_completion, this used to mark at slave_rx_callback func
-		 */
-		init_completion(&rx_cmp);
-		rxd->callback = dmatest_slave_rx_callback;
-		rxd->callback_param = &rx_cmp;
-		rx_cookie = rxd->tx_submit(rxd);
-
-		init_completion(&tx_cmp);
-		txd->callback = dmatest_slave_tx_callback;
-		txd->callback_param = &tx_cmp;
-		tx_cookie = txd->tx_submit(txd);
-
-		if (dma_submit_error(rx_cookie) ||
-		    dma_submit_error(tx_cookie)) {
-			pr_info("Error with submit function at line: %d\n",__LINE__);
-			ret = -1;
-			goto error;
-		}
-
-		dma_async_issue_pending(rx_chan);
-		dma_async_issue_pending(tx_chan);
-
-		tx_tmo = wait_for_completion_timeout(&tx_cmp, tx_tmo);
-		status = dma_async_is_tx_complete(tx_chan, tx_cookie,
-						  NULL, NULL);
-		if (tx_tmo == 0) {
-			pr_info("Timeout with tx transfer request at line: %d\n",__LINE__);
-		} else if (status != DMA_COMPLETE) {
-			pr_warn("%s: tx got completion callback,",
-				thread_name);
-			pr_warn("but status is \'%s\'\n",
-				status == DMA_ERROR ? "error" :
-				"in progress");
-		}
-
-		rx_tmo = wait_for_completion_timeout(&rx_cmp, rx_tmo);
-		status = dma_async_is_tx_complete(rx_chan, rx_cookie,
-						  NULL, NULL);
-		if (rx_tmo == 0) {
-			pr_info("Timeout with rx transfer request at line: %d\n",__LINE__);
-		} else if (status != DMA_COMPLETE) {
-			pr_warn("%s: rx got completion callback, ",
-				thread_name);
-			pr_warn("but status is \'%s\'\n",
-				status == DMA_ERROR ? "error" :
-				"in progress");
-		}
-
-error:
-		/*
-		 * Unmap the dest and sourcess buffer
-		 */
-		dma_unmap_single(tx_dev->dev, dma_srcs, 
-						 test_buf_size,
-						 DMA_MEM_TO_DEV);
-		dma_unmap_single(rx_dev->dev, dma_dsts,
-						 test_buf_size,
-						 DMA_BIDIRECTIONAL);
-
-	thread->done = true;
-    /*
-     * Notify for the dmatest_add_slave_channels that the thread has finished.
-     */
-	wake_up(&thread_wait);
-
-	return ret;
-}
-
-static int test_my_dmatest_slave_func(void *data)
-{
-	struct dmatest_slave_thread	*thread = data;
-	struct dma_chan *tx_chan;
-	struct dma_chan *rx_chan;
-	const char *thread_name;
-	unsigned int total_tests = 0;
-	dma_cookie_t tx_cookie;
-	dma_cookie_t rx_cookie;
-	enum dma_status status;
-	enum dma_ctrl_flags flags;
-	int ret;
-	int i;
-	thread_name = current->comm;
-	ret = 0;
-	/* Ensure that all previous reads are complete */
-	smp_rmb();
-	tx_chan = thread->tx_chan;
-	rx_chan = thread->rx_chan;
 	/* 
 	 * Set nice value (Priority) of this thread to 10.
 	 */
-	set_user_nice(current, 10);
-
+	conv2d_initial_fixed_paras();
+	
+	/*
+	 * Set up paramerter for conv module.
+ 	 */
+	default_paras.B = image_height - 2;
+	default_paras.C = image_width;
+	default_paras.R = 3;
+	default_paras.M2minus1 = (image_width - 2)*(image_height - 2) -1;
+	conv2d_change_size_paras(default_paras);
+	conv2d_reset();
+	image_buffer_reset();
+	conv2d_change_weight((int8_t*) weight);
+	conv2d_start();
+	fifo_init_reset((image_width - 2) * (image_height - 2) - 1);
 	flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
 		/*
 		 * Get the dma_device from tx_chan and rx_chan got from dmatest_add_slave_threads
 		 */
-		struct dma_device *tx_dev = tx_chan->device;
-		struct dma_device *rx_dev = rx_chan->device;
-		struct dma_async_tx_descriptor *txd = NULL;
-		struct dma_async_tx_descriptor *rxd = NULL;
-        dma_addr_t dma_srcs;
-		dma_addr_t dma_dsts;
-		struct completion rx_cmp;
-		struct completion tx_cmp;
-		unsigned long rx_tmo = msecs_to_jiffies(5000); /* RX takes longer */
-		unsigned long tx_tmo = msecs_to_jiffies(5000);
-		u8 align = 0;
-		struct scatterlist tx_sg[1];
-		struct scatterlist rx_sg[1];
-		unsigned int len;
 		/* honor larger alignment restrictions */
 		align = tx_dev->copy_align;
 		//pr_info("Align value: %d, %d\n",align,rx_dev->copy_align);
@@ -692,18 +509,267 @@ static int test_my_dmatest_slave_func(void *data)
 		 * !!! Note: No need to ensure the source_length divisible by 4 anymore
 		 */
 		//len = (source_length >> align) << align;
-		len = source_length;
-		dma_srcs = dma_map_single(tx_dev->dev,source_buffer,len,DMA_MEM_TO_DEV);
-		dma_dsts = dma_map_single(rx_dev->dev,dest_buffer,dest_length,DMA_BIDIRECTIONAL);
+		//dma_srcs = dma_map_single(tx_dev->dev,source_buffer,len,DMA_MEM_TO_DEV);
+		//dma_dsts = dma_map_single(rx_dev->dev,dest_buffer,dest_length,DMA_BIDIRECTIONAL);
 		
 		sg_init_table(tx_sg,1);
 		sg_init_table(rx_sg,1);
 
-		sg_dma_address(&tx_sg[0]) = dma_srcs;
-		sg_dma_address(&rx_sg[0]) = dma_dsts;
+		sg_dma_address(&tx_sg[0]) = mapped_source_buffer;
+		sg_dma_address(&rx_sg[0]) = mapped_dest_buffer;
 		 
-		sg_dma_len(&tx_sg[0]) = len;
-		sg_dma_len(&rx_sg[0]) = dest_length;
+		sg_dma_len(&tx_sg[0]) =  image_height * image_width;
+		sg_dma_len(&rx_sg[0]) = (image_height - 2) * (image_width -2 ) * 4;
+		//pr_info("Source Len: %d\n",len);
+		//pr_info("Dest_length: %d\n",dest_length);
+		rxd = rx_dev->device_prep_slave_sg(rx_chan,rx_sg,1,DMA_DEV_TO_MEM,flags,NULL);
+		txd = tx_dev->device_prep_slave_sg(tx_chan,tx_sg,1,DMA_MEM_TO_DEV,flags,NULL);
+		
+		if(!rxd || !txd){
+			///dma_unmap_single(tx_dev->dev,dma_srcs,len,DMA_MEM_TO_DEV);
+			//dma_unmap_single(rx_dev->dev,dma_dsts,len,DMA_BIDIRECTIONAL);
+			pr_info("Unable with device_prep_slave_sg function, At line: %d\n",__LINE__);
+			ret = -1;
+			goto error;
+		}
+		
+		init_completion(&rx_cmp);
+		rxd->callback = dmatest_slave_rx_callback;
+		rxd->callback_param = &rx_cmp;
+		rx_cookie = rxd->tx_submit(rxd);
+
+		init_completion(&tx_cmp);
+		txd->callback = dmatest_slave_tx_callback;
+		txd->callback_param = &tx_cmp;
+		tx_cookie = txd->tx_submit(txd);
+		if(dma_submit_error(rx_cookie) || 
+		   dma_submit_error(tx_cookie)) {
+			pr_info("Error with dma_submit_error function, At line: %d\n",__LINE__);
+			ret = -1;
+			goto error;
+		   }
+		
+		dma_async_issue_pending(rx_chan);
+		dma_async_issue_pending(tx_chan);
+
+		tx_tmo = wait_for_completion_timeout(&tx_cmp,tx_tmo);
+		status = dma_async_is_tx_complete(tx_chan,tx_cookie,NULL,NULL);
+
+		if(tx_tmo == 0){
+			pr_info("Tx transfer timed out\n");
+			ret = -1;
+			goto error;
+		}
+		else if(status != DMA_COMPLETE) {
+			pr_info("Got the tx call back, but status is: %s",status == DMA_ERROR ? "error" : "in progress");
+			ret = -1;
+			goto error;
+		}
+
+		rx_tmo = wait_for_completion_timeout(&rx_cmp,rx_tmo);
+		status = dma_async_is_tx_complete(rx_chan,rx_cookie,NULL,NULL);
+
+		if(rx_tmo == 0){
+			pr_info("Tx transfer timed out\n");
+			ret = -1;
+			goto error;
+		} 
+		else if(status != DMA_COMPLETE) {
+			pr_info("Got the rx call back, but status is: %s",status == DMA_ERROR ? "error" : "in progress");
+			ret = -1;
+			goto error;
+		}
+		/* for(i=0;i<30;i++){
+			printk(KERN_CONT  "%d ", tempt_dest_buffer[i]);
+		}
+		for(i = 0; i < (image_height - 2); i++){
+			printk(KERN_INFO "[ ");
+			for(j = 0; j < (image_width -2); j++){
+				printk(KERN_CONT  "%d ", tempt_dest_buffer[i*(image_width-2) + j]);
+			}
+			printk(KERN_CONT "]\n");
+		} */
+	//pr_info("Slave thread take: %d minisecond", jiffies_to_msecs(jiffies - mark_time));
+ error:
+	return ret;
+}
+
+static int tempt_force_coherent_test_my_dmatest_slave_func(void)
+{
+
+	int ret = 0;
+	int i,j,k,q;
+	int8_t* tempt_source_buffer;
+	int32_t * tempt_dest_buffer;
+	int8_t* tempt_kernel_buffer;
+	u32 dest_image_height;
+	u32 dest_image_width;
+	tempt_source_buffer = (int8_t*)coherent_source_buffer;
+	if(tempt_source_buffer == NULL){
+		pr_info("tempt_source_buffer NULL value");
+		goto end;
+	}
+	/* pr_info("Source buffer: ");
+	for(i = 0; i < image_height; i++){
+		printk(KERN_INFO "[ ");
+		for(j = 0; j < image_width; j++){
+			printk(KERN_CONT  "%d ", tempt_source_buffer[i*image_height + j]);
+		}
+		printk(KERN_CONT "]\n");
+	} */
+
+	tempt_dest_buffer = (int32_t*)coherent_dest_buffer;
+	if(tempt_dest_buffer == NULL){
+		pr_info("tempt_dest_buffer NULL value");
+		goto end;
+	}
+	dest_image_height = image_height -3 + 1;
+	dest_image_width = image_width - 3 + 1;
+
+	tempt_kernel_buffer = (int8_t*)weight;
+	if(tempt_kernel_buffer == NULL){
+		pr_info("tempt_kernel_buffer NULL value");
+		goto end;
+	}
+	
+	/* pr_info("Kernel buffer: ");
+	for(k = 0; k < 3; k++){
+		printk(KERN_INFO "[ ");
+		for(q = 0; q < 3; q++){
+			printk(KERN_CONT " %d ", tempt_kernel_buffer[k*3 + q]);
+		}
+		printk(KERN_CONT "]\n");
+	} */
+
+	for(i = 0; i < dest_image_height; i++){
+		for(j = 0; j < dest_image_width; j++){
+			tempt_dest_buffer[i * dest_image_height + j] = 0;
+			for(k = 0; k < 3; k++){
+				for(q = 0; q < 3; q++){
+					tempt_dest_buffer[i * dest_image_height + j] += tempt_kernel_buffer[k*3 + q] * tempt_source_buffer[((i) + k ) * image_height + (j) + q];
+				}
+			}
+		}
+	}
+
+	/* pr_info("Dest buffer: ");
+	for(i = 0; i < dest_image_height; i++){
+		printk(KERN_INFO "[ ");
+		for(j = 0; j < dest_image_width; j++){
+			printk(KERN_CONT  "%d ", tempt_dest_buffer[i * dest_image_height + j]);
+		}
+		printk(KERN_CONT "]\n");
+	} */
+		
+    /*
+     * Notify for the dmatest_add_slave_channels that the thread has finished.
+     */
+	 
+	//dma_unmap_single(tx_dev->dev,dma_srcs,len,DMA_MEM_TO_DEV);
+	//dma_unmap_single(rx_dev->dev,dma_dsts,dest_length,DMA_BIDIRECTIONAL);
+end:
+	return 0;
+}
+
+static int tempt_coherent_test_my_dmatest_slave_func(void *data)
+{
+	unsigned long mark_time = jiffies;
+	struct dmatest_slave_thread	*thread = data;
+	struct dma_chan *tx_chan = thread->tx_chan;
+	struct dma_chan *rx_chan = thread->rx_chan;
+	const char *thread_name;
+	dma_cookie_t tx_cookie;
+	dma_cookie_t rx_cookie;
+	enum dma_status status;
+	enum dma_ctrl_flags flags;
+	int ret = 0;
+	struct dma_device *tx_dev = tx_chan->device;
+	struct dma_device *rx_dev = rx_chan->device;
+	struct dma_async_tx_descriptor *txd = NULL;
+	struct dma_async_tx_descriptor *rxd = NULL;
+	struct completion rx_cmp;
+	struct completion tx_cmp;
+	con2d_size_paras default_paras;
+	int i = 0;
+	int j = 0;
+	int8_t* tempt_kernel_buffer = (int8_t*)(weight);
+	int8_t* tempt_source_buffer = (int8_t*)(coherent_source_buffer);
+	int32_t* tempt_dest_buffer = (int32_t*)(coherent_dest_buffer);
+	unsigned long rx_tmo = msecs_to_jiffies(5000); /* RX takes longer */
+	unsigned long tx_tmo = msecs_to_jiffies(5000);
+	u8 align = 0;
+	struct scatterlist tx_sg[1];
+	struct scatterlist rx_sg[1];
+	thread_name = current->comm;
+	/* pr_info("Kernel filter: ");
+	for(i = 0; i < 3; i++){
+		printk(KERN_INFO "[ ");
+		for(j = 0; j < 3; j++){
+			printk(KERN_CONT  "%d ", tempt_kernel_buffer[i*3 + j]);
+		}
+		printk(KERN_CONT "]\n");
+	}
+	pr_info("Source buffer:");
+	for(i = 0; i < image_height; i++){
+		printk(KERN_INFO "[ ");
+		for(j = 0; j < image_width; j++){
+			printk(KERN_CONT  "%d ", tempt_source_buffer[i * image_height + j]);
+		}
+		printk(KERN_CONT "]\n");
+	} */
+	/* Ensure that all previous reads are complete */
+	smp_rmb();
+	/* 
+	 * Set nice value (Priority) of this thread to 10.
+	 */
+	set_user_nice(current, 10);
+	
+	conv2d_initial_fixed_paras();
+	
+	/*
+	 * Set up paramerter for conv module.
+ 	 */
+	default_paras.B = image_height - 2;
+	default_paras.C = image_width;
+	default_paras.R = 3;
+	default_paras.M2minus1 = (image_width - 2)*(image_height - 2) -1;
+	conv2d_change_size_paras(default_paras);
+	conv2d_reset();
+	image_buffer_reset();
+	conv2d_change_weight((int8_t*) weight);
+	conv2d_start();
+	fifo_init_reset((image_width - 2) * (image_height - 2) - 1);
+	flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
+		/*
+		 * Get the dma_device from tx_chan and rx_chan got from dmatest_add_slave_threads
+		 */
+		/* honor larger alignment restrictions */
+		align = tx_dev->copy_align;
+		//pr_info("Align value: %d, %d\n",align,rx_dev->copy_align);
+		if (rx_dev->copy_align > align)
+			align = rx_dev->copy_align;
+
+		if ((1 << align) > test_buf_size) {
+			pr_err("%u-byte buffer too small for %d-byte alignment\n",
+			       test_buf_size, 1 << align);
+			ret = -1; 
+			goto error;
+		}
+		/*
+		 * !!! Note: No need to ensure the source_length divisible by 4 anymore
+		 */
+		//len = (source_length >> align) << align;
+		//dma_srcs = dma_map_single(tx_dev->dev,source_buffer,len,DMA_MEM_TO_DEV);
+		//dma_dsts = dma_map_single(rx_dev->dev,dest_buffer,dest_length,DMA_BIDIRECTIONAL);
+		
+		sg_init_table(tx_sg,1);
+		sg_init_table(rx_sg,1);
+
+		sg_dma_address(&tx_sg[0]) = mapped_source_buffer;
+		sg_dma_address(&rx_sg[0]) = mapped_dest_buffer;
+		 
+		sg_dma_len(&tx_sg[0]) =  image_height * image_width;
+		sg_dma_len(&rx_sg[0]) = (image_height - 2) * (image_width -2 ) * 4;
 		//pr_info("Source Len: %d\n",len);
 		//pr_info("Dest_length: %d\n",dest_length);
 		rxd = rx_dev->device_prep_slave_sg(rx_chan,rx_sg,1,DMA_DEV_TO_MEM,flags,NULL);
@@ -764,27 +830,26 @@ static int test_my_dmatest_slave_func(void *data)
 			ret = -1;
 			goto error;
 		}
-		//pr_info("Tx ma_chan and Rx dma_chan at address: %x, %x\n",(unsigned int)tx_chan,(unsigned int)rx_chan);
-		/*
-		 * Init a test case.
-		 */
-		/*
-		 * Emulate a test case.
-		 */
-		/* for(i=0;i<source_length;i++){
-			dest_buffer[i] = source_buffer[i];
+		/* for(i=0;i<30;i++){
+			printk(KERN_CONT  "%d ", tempt_dest_buffer[i]);
+		}
+		for(i = 0; i < (image_height - 2); i++){
+			printk(KERN_INFO "[ ");
+			for(j = 0; j < (image_width -2); j++){
+				printk(KERN_CONT  "%d ", tempt_dest_buffer[i*(image_width-2) + j]);
+			}
+			printk(KERN_CONT "]\n");
 		} */
-		/*
-		 * Physic address of source buffer.
-		 */
+	pr_info("Slave thread take: %d minisecond", jiffies_to_msecs(jiffies - mark_time));
  error:
 	thread->done = true;
+	put_task_struct(thread->task);
     /*
      * Notify for the dmatest_add_slave_channels that the thread has finished.
      */
 	 
-	dma_unmap_single(tx_dev->dev,dma_srcs,len,DMA_MEM_TO_DEV);
-	dma_unmap_single(rx_dev->dev,dma_dsts,dest_length,DMA_BIDIRECTIONAL);
+	//dma_unmap_single(tx_dev->dev,dma_srcs,len,DMA_MEM_TO_DEV);
+	//dma_unmap_single(rx_dev->dev,dma_dsts,dest_length,DMA_BIDIRECTIONAL);
 	wake_up(&thread_wait);
 	if(pid < 0){
 		pr_info("Pid was not initialized !");
@@ -794,7 +859,7 @@ static int test_my_dmatest_slave_func(void *data)
 	t = pid_task(find_pid_ns(pid, &init_pid_ns), PIDTYPE_PID);
 	if (t != NULL) {
     rcu_read_unlock();      
-    if (send_sig_info(SIG_TEST, &info, t) < 0) {
+    if (send_sig_info(sig_num, &info, t) < 0) {
 			pr_info("send_sig_info error\n");
 			return -1;
 		}
@@ -804,6 +869,105 @@ static int test_my_dmatest_slave_func(void *data)
     	rcu_read_unlock();
     	return -1;
 	}
+
+	return ret;
+}
+
+static int coherent_test_my_dmatest_slave_func(void *data)
+{
+	struct dmatest_slave_thread	*thread = data;
+	int ret = 0;
+	int i,j,k,q;
+	int8_t* tempt_source_buffer;
+	int32_t * tempt_dest_buffer;
+	int8_t* tempt_kernel_buffer;
+	u32 dest_image_height;
+	u32 dest_image_width;
+	tempt_source_buffer = (int8_t*)coherent_source_buffer;
+	if(tempt_source_buffer == NULL){
+		pr_info("tempt_source_buffer NULL value");
+		goto end;
+	}
+	/* pr_info("Source buffer: ");
+	for(i = 0; i < image_height; i++){
+		printk(KERN_INFO "[ ");
+		for(j = 0; j < image_width; j++){
+			printk(KERN_CONT  "%d ", tempt_source_buffer[i*image_height + j]);
+		}
+		printk(KERN_CONT "]\n");
+	} */
+
+	tempt_dest_buffer = (int32_t*)coherent_dest_buffer;
+	if(tempt_dest_buffer == NULL){
+		pr_info("tempt_dest_buffer NULL value");
+		goto end;
+	}
+	dest_image_height = image_height -3 + 1;
+	dest_image_width = image_width - 3 + 1;
+
+	tempt_kernel_buffer = (int8_t*)weight;
+	if(tempt_kernel_buffer == NULL){
+		pr_info("tempt_kernel_buffer NULL value");
+		goto end;
+	}
+	
+	/* pr_info("Kernel buffer: ");
+	for(k = 0; k < 3; k++){
+		printk(KERN_INFO "[ ");
+		for(q = 0; q < 3; q++){
+			printk(KERN_CONT " %d ", tempt_kernel_buffer[k*3 + q]);
+		}
+		printk(KERN_CONT "]\n");
+	} */
+
+	for(i = 0; i < dest_image_height; i++){
+		for(j = 0; j < dest_image_width; j++){
+			tempt_dest_buffer[i * dest_image_height + j] = 0;
+			for(k = 0; k < 3; k++){
+				for(q = 0; q < 3; q++){
+					tempt_dest_buffer[i * dest_image_height + j] += tempt_kernel_buffer[k*3 + q] * tempt_source_buffer[((i) + k ) * image_height + (j) + q];
+				}
+			}
+		}
+	}
+
+	/* pr_info("Dest buffer: ");
+	for(i = 0; i < dest_image_height; i++){
+		printk(KERN_INFO "[ ");
+		for(j = 0; j < dest_image_width; j++){
+			printk(KERN_CONT  "%d ", tempt_dest_buffer[i * dest_image_height + j]);
+		}
+		printk(KERN_CONT "]\n");
+	} */
+		
+    /*
+     * Notify for the dmatest_add_slave_channels that the thread has finished.
+     */
+	 
+	//dma_unmap_single(tx_dev->dev,dma_srcs,len,DMA_MEM_TO_DEV);
+	//dma_unmap_single(rx_dev->dev,dma_dsts,dest_length,DMA_BIDIRECTIONAL);
+end:
+	thread->done = true;
+	wake_up(&thread_wait);
+	if(pid < 0){
+		pr_info("Pid was not initialized !");
+		return ret;
+	}
+	rcu_read_lock();
+	t = pid_task(find_pid_ns(pid, &init_pid_ns), PIDTYPE_PID);
+	if (t != NULL) {
+    rcu_read_unlock();      
+    if (send_sig_info(sig_num, &info, t) < 0) {
+			pr_info("send_sig_info error\n");
+			return -1;
+		}
+		return 0;
+	} else {
+    	pr_info("pid_task error\n");
+    	rcu_read_unlock();
+    	return -1;
+	}
+	put_task_struct(thread->task);
 	return ret;
 }
 
@@ -852,59 +1016,6 @@ static void dmatest_clean_all_threads(struct dmatest_chan *dtc){
 		put_task_struct(thread->task);
 		kfree(thread);
 	}
-}
-
-static int dmatest_add_slave_threads(struct dmatest_chan *tx_dtc,
-				     struct dmatest_chan *rx_dtc)
-{
-	struct dmatest_slave_thread *thread;
-	struct dma_chan *tx_chan = tx_dtc->chan;
-	struct dma_chan *rx_chan = rx_dtc->chan;
-	int ret;
-
-
-	thread = kzalloc(sizeof(struct dmatest_slave_thread), GFP_KERNEL);
-	if (!thread) {
-		pr_warn("dmatest: No memory for slave thread %s-%s\n",
-			dma_chan_name(tx_chan), dma_chan_name(rx_chan));
-	}
-
-    /*
-    Store the tx_chan and rx_chan for the my_dmatest_slave_func func.
-    */
-	thread->tx_chan = tx_chan;
-	thread->rx_chan = rx_chan;
-	thread->type = (enum dma_transaction_type)DMA_SLAVE;
-	thread->done = false;
-	/* Ensure that all previous writes are complete */
-	smp_wmb();
-	/*
-	Create a task_struct with the function executed is dmatest_slave_func
-	and input parameter is (void*) thread pointer
-	*/
-	thread->task = kthread_run(my_dmatest_slave_func, thread, "%s-%s",
-				   dma_chan_name(tx_chan),
-				   dma_chan_name(rx_chan));
-	ret = PTR_ERR(thread->task);
-	if (IS_ERR(thread->task)) {
-		pr_warn("dmatest: Failed to run thread %s-%s\n",
-			dma_chan_name(tx_chan), dma_chan_name(rx_chan));
-		kfree(thread);
-		return ret;
-	}
-
-	/* srcbuf and dstbuf are allocated by the thread itself */
-	/* 
-	Increase the reference count of the given task_struct.
-	*/
-	get_task_struct(thread->task);
-	/*
-	Add the node of thread to the node list tx_dtc->threads
-	*/
-	list_add_tail(&thread->node, &tx_dtc->threads);
-
-	/* Added one thread with 2 channels */
-	return 1;
 }
 
 /*
@@ -983,9 +1094,16 @@ static int my_dmatest_add_slave_threads(int chan_num)
 	 * Create a task_struct with the function executed is dmatest_slave_func
 	 * and input parameter is (void*) thread pointer
 	 */
-	thread->task = kthread_run(test_my_dmatest_slave_func, thread, "%s-%s",
+	ktime_t start, end;
+	start = ktime_get();
+	thread->task = kthread_run(coherent_test_my_dmatest_slave_func, thread, "%s-%s",
 				   dma_chan_name(thread->tx_chan),
 				   dma_chan_name(thread->rx_chan));
+	end = ktime_get();
+	s64 time_diff_ns = ktime_to_ns(ktime_sub(end, start));
+	unsigned long tempt = time_diff_ns;
+	pr_info("Execution time: %ld ns\n", tempt);
+
 	ret = PTR_ERR(thread->task);
 	if (IS_ERR(thread->task)) {
 		pr_warn("dmatest: Failed to run thread %s-%s\n",
@@ -1015,7 +1133,6 @@ static int my_dmatest_add_slave_channels(struct dma_chan *tx_chan,
 {
 	struct dmatest_chan *tx_dtc;
 	struct dmatest_chan *rx_dtc;
-	unsigned int thread_count = 0;
 	tx_dtc = kmalloc(sizeof(struct dmatest_chan), GFP_KERNEL);
 	if (!tx_dtc) {
 		pr_warn("dmatest: No memory for tx %s\n",
@@ -1088,97 +1205,47 @@ static int my_dmatest_add_slave_channels(struct dma_chan *tx_chan,
 	return 0;
 }
 
-#define AXIDMA_FILE "file_axidma"
-#define AXIDMA_CLASS "class_axidma"
-#define AXIDMA_DEVICE "device_axidma"
-
-void generate_test(uint16_t input_height, uint16_t input_width){
-    memset(source_buffer,0,test_buf_size); 
-    memset(dest_buffer,0,test_buf_size);
-	conv2d_initial_fixed_paras();
-	//uint16_t input_height = 10;
-	//uint16_t input_width = 10;
-	uint8_t weight_vector[] = {100,100,100,100,100,100,100,100,100};
-	source_length = input_width*input_height;
-	/*
-	 * Init a test case for driver.
-	 */
-	int i;
-	int j;
-	int ret;
-	uint32_t tempt;
-	for(i=0;i<source_length;i++){
-		get_random_bytes(&tempt, sizeof(tempt)); 
-		source_buffer[i] = 125;
-	}
-	//spr_info("Init a test case: \n");
-	/* for(i = 0; i < (input_height); i++){
-		printk(KERN_INFO "[ ");
-		for(j = 0; j < (input_width); j++){
-			printk(KERN_CONT  "%d ",source_buffer[i*(input_width) + j]);
-		}
-		printk(KERN_CONT "]\n");
-	} */
-	con2d_size_paras default_paras;
-	/*
-	 * Set up paramerter for conv module.
- 	 */
-	default_paras.B = input_height - 2;
-	default_paras.C = input_width;
-	default_paras.R = 3;
-	default_paras.M2minus1 = (input_width - 2)*(input_height - 2) -1;
-	conv2d_change_size_paras(default_paras);
-	conv2d_reset();
-	image_buffer_reset();
-	conv2d_change_weight(weight_vector);
-	conv2d_start();
-
-	// Start the dma transfer.
-	/*
-	 * Need change the size of dest buffer.
- 	 */
-	dest_length = (input_width - 2)*(input_height - 2)*4;
-	fifo_init_reset(dest_length/4 - 1);
-	//pr_info("Value of threshold register before run: %d\n",get_threshold());
-	unsigned long marked_time = jiffies;
-	my_dmatest_add_slave_threads(0);
-	ret = wait_event_timeout(thread_wait,my_is_threaded_test_run(0),msecs_to_jiffies(5000));
-	pr_info("It take: %d\n",jiffies_to_msecs(jiffies - marked_time));
-	if(ret == 0 ){
-		pr_info("Time out in file_write function");
-		//return -1;
-	}
-	pr_info("Number of byte received at fifo: %x\n",get_counter());
-	//pr_info("Value of threshold register after run: %d\nValue of counter register: %d\n",get_threshold(),get_counter());
-	//pr_info("It take: %d minitimes",jiffies_to_msecs(jiffies - time_tempt));
-	/* pr_info("Check value from dest_buffer: \n");
-	for(i = 0; i < (input_height - 2); i++){
-		printk(KERN_INFO "[ ");
-		for(j = 0; j < (input_width -2); j++){
-			printk(KERN_CONT  "%u ",dest_buffer[i*(input_width-2) + j]);
-		}
-		printk(KERN_CONT "]\n");
-	} */
-}
 static int xilinx_axidmatest_probe(struct platform_device *pdev)
 {
-    nr_channels  = 0;
 	struct dma_chan *tx_chan, *rx_chan;
 	int chan_num = 0;
 	int err;
 	int ret;
-	unsigned long time_tempt;
+	u64 dma_mask;
 	pid = -1;
-	source_buffer = kmalloc(test_buf_size,GFP_KERNEL);
+	nr_channels  = 0;
+    dma_mask = DMA_BIT_MASK(8 * sizeof(dma_addr_t));
+    ret = dma_set_coherent_mask(&pdev->dev, dma_mask);
+    if (ret < 0) {
+        pr_info("Unable to set the DMA coherent mask.\n");
+        return ret;
+    } 
+	
+	/* coherent_source_buffer = dma_alloc_coherent(&pdev->dev,MAX_SRC_BUFFER,&mapped_source_buffer,GFP_KERNEL);
+	if(coherent_source_buffer == NULL){ 
+		pr_info("Unable to allocate for coherent_source_buffer");
+		return -1;
+	} */
+	coherent_source_buffer = NULL;
+
+	/* coherent_dest_buffer = dma_alloc_coherent(&pdev->dev,MAX_DEST_BUFFER,&mapped_dest_buffer,GFP_KERNEL);
+	if(coherent_dest_buffer == NULL){
+		pr_info("Unable to allocate for coherent_dest_buffer");
+		return -1;
+	} */
+	coherent_dest_buffer = NULL;
+	weight = NULL;
+
+	/* source_buffer = kmalloc(test_buf_size,GFP_KERNEL);
 	if(!source_buffer){
 		pr_info("Unable to allocate for source_buffer");
 		return -1;
-	}
-	dest_buffer = kmalloc(test_buf_size,GFP_KERNEL);
+	} */
+	/* dest_buffer = kmalloc(test_buf_size,GFP_KERNEL);
 	if(!dest_buffer){
 		pr_info("Unable to allocat for dest_buffer");	
 		return -1;
-	}
+	} */
 	if(alloc_chrdev_region(&my_axidma_driver.dev, 0, 1,AXIDMA_FILE) < 0){
 			pr_info("Can not allocate major number\n");
 			return -1;
@@ -1194,13 +1261,14 @@ static int xilinx_axidmatest_probe(struct platform_device *pdev)
 	/*
 	 * Link the platform device to the axidma_driver entity.
 	*/
+	my_axidma_driver.container = NULL;
 	my_axidma_driver.container = &pdev->dev;
 
 	/*
 	Get the tx_channel created by dma platform driver xilinx_dma.c
 	*/
-    memset(source_buffer,0,test_buf_size); 
-    memset(dest_buffer,0,test_buf_size);
+    /* memset(source_buffer,0,test_buf_size); 
+    memset(dest_buffer,0,test_buf_size); */
 	/*
 	Get the tx_channel created by dma platform driver xilinx_dma.c
 	*/
@@ -1211,6 +1279,7 @@ static int xilinx_axidmatest_probe(struct platform_device *pdev)
 			pr_err("xilinx_dmatest: No Tx channel\n");
 		return err;
 	}
+	force_tx_chan = tx_chan;
 	pr_info("Find the tx dma_chan created by platform driver, address: %x\n",(unsigned int)tx_chan);
 	/*
 	Get the rx_channel created by dma platform driver xilinx_dma.c
@@ -1222,7 +1291,9 @@ static int xilinx_axidmatest_probe(struct platform_device *pdev)
 			pr_err("xilinx_dmatest: No Rx channel\n");
 		goto free_tx;
 	}
+	force_rx_chan = rx_chan;
 	pr_info("Find the rx dma_chan created by platform driver, address: %x\n",(unsigned int)rx_chan);
+
 	
 	err = my_dmatest_add_slave_channels(tx_chan, rx_chan,chan_num);
 	
@@ -1248,32 +1319,24 @@ static int xilinx_axidmatest_probe(struct platform_device *pdev)
 		pr_info("Error with ioremap func at line: %d\n",__LINE__);
 		return -1;
 	}
-	int i;
-	for(i = 0; i < 10;i++){
-		generate_test(200,200);
-	}	
-	/*
-	 *  End test case !.
-	 */
 	return 0;
 
 free_rx:
 	dma_release_channel(rx_chan);
+	return err;
 free_tx:
 	dma_release_channel(tx_chan);
-
 	return err;
 }
 
 static int xilinx_axidmatest_remove(struct platform_device *pdev)
 {
+	struct dmatest_chan *dtc, *_dtc;
+	struct dma_chan *chan;
 	cdev_del(&my_axidma_driver.cdev); 
 	device_destroy(my_axidma_driver.class,my_axidma_driver.dev);
 	class_destroy(my_axidma_driver.class);
 	unregister_chrdev_region(my_axidma_driver.dev,1);
-	struct dmatest_chan *dtc, *_dtc;
-	struct dma_chan *chan;
-
 	/*
 	Iter through the dmatest_channels list_head
 	*/
@@ -1292,8 +1355,6 @@ static int xilinx_axidmatest_remove(struct platform_device *pdev)
 		dmaengine_terminate_all(chan);
 		dma_release_channel(chan);
 	}
-	kfree(source_buffer);
-	kfree(dest_buffer);
 	if(Conv2D.BaseAddress != NULL){
 		iounmap(Conv2D.BaseAddress);
 	}
@@ -1309,8 +1370,7 @@ static const struct of_device_id xilinx_axidmatest_of_ids[] = {
 };
 
 static int file_open (struct inode * inode, struct file *file) {
-	memset(source_buffer,0,test_buf_size);
-	memset(dest_buffer,0,test_buf_size);
+	file->private_data  = NULL;
 	pr_info("/dev/device_axidma opened");
 	return 0;
 }
@@ -1319,49 +1379,219 @@ static int file_release (struct inode * inode, struct file *file){
 	return 0;	
 }
 static ssize_t file_write (struct file * file, const char __user * buff, size_t length, loff_t * loff_of) {
-	int ret;
-	ret = copy_from_user(source_buffer,buff,length);
-	source_length = length;
-	if(ret){
-		pr_info("/dev/device_axidma write not succeed\n");
-		return -1;
-	}
-	my_dmatest_add_slave_threads(0);
-	ret = wait_event_timeout(thread_wait,my_is_threaded_test_run(0),msecs_to_jiffies(5000));
-	if(ret == 0 ){
-		pr_info("Time out in file_write function");
-		return -1;
-	}
 	return length;
 }
 static ssize_t file_read (struct file * file,char __user * buff, size_t length, loff_t * loff_of){
-	if(copy_to_user(buff,dest_buffer,length)){
-		pr_info("/dev/device_axidma read not succeed\n");
-		return -1;
-	}
 	return length;
 }
+
 static long file_ioctl(struct file *filep, unsigned int cmd, unsigned long arg){
+	pre_cmd = cmd;
+	ktime_t start, end;
+	start = ktime_get();
+	int* tempt_coherent_source_buffer;
+	s64 time_diff_ns;
+	int i = 0;
+	int result;
+	unsigned long tempt;
 	switch(cmd){ 
 		case SET_PID_CMD:
 			//memset(config_data, 0, 1024);
-			if(copy_from_user(&pid, (int*)arg,sizeof(int))){
+			/* if(copy_from_user(&pid, (int*)arg,sizeof(int))){
 				pr_info("error at %d \n",__LINE__);
 				return -1;
-			};
+			}; */
+			pid = (int)(arg);
+			if(pid < 0){
+				pr_info("Invalid pid value.");
+				return -1;
+			}
+			memset(&info, 0 , sizeof(struct kernel_siginfo));
+			info.si_signo = SIG_TEST;
+			info.si_code = SI_QUEUE;
+			info.si_int = 15;
 			printk(KERN_INFO "NamTran %s, %d, pid = %d\n", __func__, __LINE__, pid);
 		break;
+		
+		case SET_IMAGE_HEIGHT_WIDTH:
+			image_height = (uint16_t)((arg &  0xFFFF0000) >> 16);
+			image_width = (uint16_t)(arg & 0x0000FFFF);
+			//pr_info("Image height: %d, image_width: %d",image_height,image_width);
+		break;
 
+		/* case START_CACULATE: 
+			sig_num = (int)arg;
+			pr_info("Got sig_num value: %d\n",sig_num);
+			info.si_signo = sig_num;
+			if (image_width == 0 || image_height == 0){
+				pr_info("Image width and image height were not set");
+				return -1;
+			}
+			start = ktime_get();
+			my_dmatest_add_slave_threads(0);	
+			end = ktime_get();
+			time_diff_ns = ktime_to_ns(ktime_sub(end, start));
+			tempt = time_diff_ns;
+			pr_info("Execution time of my_dmatest_add_slave_threads: %ld ns\n", tempt);
+		break; */
+
+		case START_CACULATE:
+			/* if (image_width == 0 || image_height == 0){
+				pr_info("Image width and image height were not set");
+				return -1;
+			}*/
+			start = ktime_get();
+			result = force_coherent_test_my_dmatest_slave_func();
+			end = ktime_get();
+			time_diff_ns = ktime_to_ns(ktime_sub(end, start));
+			pr_info("Execution time of force_coherent_test_my_dmatest_slave_func: %ld ns\n", time_diff_ns);
+			/* end = ktime_get();
+			time_diff_ns = ktime_to_ns(ktime_sub(end, start));
+			pr_info("Ioctl take: %lld",time_diff_ns); */
+			return result;
+		break;
+
+		/* case TEST_MMAP:
+			pr_info("TEST_MMAP for soucce_buffer has been called: ");
+			tempt_coherent_source_buffer = (int*)coherent_source_buffer;
+			for(i=0;i<10;i++){
+				tempt_coherent_source_buffer[i] = i;s
+			}
+		break; */ 
 		default:
-			return -1;
+			return 0;
 	}
-	memset(&info, 0 , sizeof(struct kernel_siginfo));
-	info.si_signo = SIG_TEST;
-	info.si_code = SI_QUEUE;
-	info.si_int = 15;
 
 	return 0;
 }
+
+static int file_mmap(struct file *file, struct vm_area_struct *vma){
+	int ret;
+	size_t size;
+	unsigned long pfn;
+	void* tempt_kern_buff;
+	struct dma_memory* src_buff_mem;
+	struct dma_memory* dst_buff_mem;
+	dma_addr_t tempt_dma_addr;
+	size = vma->vm_end - vma->vm_start;
+	switch(pre_cmd){ 
+		case PRE_SRC_BUFF:
+			if(coherent_source_buffer != NULL){
+				pr_info("coherent_source_buffer has been allocated !");
+				goto unknown_error;
+			}
+			coherent_source_buffer = dma_alloc_coherent(my_axidma_driver.container, size, &mapped_source_buffer,GFP_KERNEL);
+			if(coherent_source_buffer == NULL){ 
+				pr_info("Unable to allocate for coherent_source_buffer");
+				return -1;
+			}
+			ret = dma_mmap_coherent(my_axidma_driver.container, vma, coherent_source_buffer, mapped_source_buffer , size);
+			tempt_dma_addr = mapped_source_buffer;
+			tempt_kern_buff = coherent_source_buffer;
+			if(ret < 0 ){
+				pr_info("Error with dma_mmap_coherent function of source buffer");
+				goto free_dma_region;
+			}
+			src_buff_mem = kmalloc(sizeof(struct dma_memory), GFP_KERNEL);
+			if(src_buff_mem == NULL){
+				pr_info("Error with src_buff_mem allocate");
+				goto free_dma_region;
+			}
+			src_buff_mem->kernel_buffer = coherent_source_buffer;
+			src_buff_mem->size = size;
+			src_buff_mem->dma_address = mapped_source_buffer; 
+			vma->vm_private_data =  (void*)src_buff_mem;
+			pr_info("Successfully mmap for source_buffer");
+		break;
+
+		case PRE_DEST_BUFF:
+			if(coherent_dest_buffer != NULL){
+				pr_info("coherent_dest_buffer has been allocated !");
+				goto unknown_error;
+			}
+			coherent_dest_buffer = dma_alloc_coherent(my_axidma_driver.container, size ,&mapped_dest_buffer,GFP_KERNEL);
+			if(coherent_dest_buffer == NULL){
+				pr_info("Unable to allocate for coherent_dest_buffer");
+				return -1;
+			}
+			ret = dma_mmap_coherent(my_axidma_driver.container, vma, coherent_dest_buffer, mapped_dest_buffer , size);
+			tempt_dma_addr = mapped_dest_buffer;
+			tempt_kern_buff = coherent_dest_buffer;
+			if(ret < 0){
+				pr_info("Error with dma_mmap_coherent function of dest buffer");
+				goto free_dma_region;
+			}
+			dst_buff_mem = kmalloc(sizeof(struct dma_memory), GFP_KERNEL);
+			if(dst_buff_mem == NULL){
+				pr_info("Error with src_buff_mem allocate");
+				goto free_dma_region;
+			}
+			dst_buff_mem->kernel_buffer = coherent_dest_buffer;
+			dst_buff_mem->size = size;
+			dst_buff_mem->dma_address = mapped_dest_buffer;
+			vma->vm_private_data =  (void*)dst_buff_mem;
+			pr_info("Successfully mmap for dest_buffer");
+		break;
+
+		case PRE_KERNEL_BUFF:
+			page_weight = alloc_pages(GFP_KERNEL,(KERNEL_LEN >> PAGE_SHIFT) + 1);
+			if(page_weight == NULL){
+				pr_info("Error with page_weight");
+				goto unknown_error;
+			}
+			weight = page_address(page_weight);
+			if(weight == NULL){
+				__free_pages(page_weight, (KERNEL_LEN >> PAGE_SHIFT) + 1);
+				goto unknown_error;
+			}
+			pfn = page_to_pfn(page_weight);
+			ret =  remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
+			if( ret < 0 ){
+				pr_err("Could not map the addres areas\n");
+				__free_pages(page_weight, (KERNEL_LEN >> PAGE_SHIFT) + 1);
+				return ret;
+			}
+			vma->vm_private_data = (void*)(page_weight);
+			pr_info("Successfully mmap for kernel_buffer");
+		break;
+		
+		default:
+			pr_info("Unknown which kind of buffer you want to mmap.");
+			return -1;
+	}
+	vma->vm_ops = &axidma_vm_ops;
+	return 0;
+free_dma_region:
+	dma_free_coherent(my_axidma_driver.container, size, tempt_kern_buff, tempt_dma_addr);
+	return -2;
+unknown_error:
+	return -1;
+}
+
+static void axidma_vma_close(struct vm_area_struct *vma) {
+	pr_info("vma_close was called");
+	void* tempt = NULL;
+	tempt = vma->vm_private_data;
+	if((struct page*)(tempt) == page_weight){
+		if(weight != NULL){
+			__free_pages(page_weight, (KERNEL_LEN >> PAGE_SHIFT) + 1);
+			weight = NULL;
+		}
+	}
+	else {
+		struct dma_memory* tempt_dma_mem;
+		tempt_dma_mem = (struct dma_memory*)(tempt);
+		dma_free_coherent(my_axidma_driver.container, tempt_dma_mem->size, tempt_dma_mem->kernel_buffer, tempt_dma_mem->dma_address);
+		if(tempt_dma_mem->kernel_buffer == coherent_source_buffer){
+			coherent_source_buffer = NULL;
+		}
+		if(tempt_dma_mem->kernel_buffer == coherent_dest_buffer){
+			coherent_dest_buffer = NULL;
+		}
+		kfree(tempt_dma_mem);
+	}
+}
+
 
 static struct platform_driver xilinx_axidmatest_driver = {
 	.driver = {
