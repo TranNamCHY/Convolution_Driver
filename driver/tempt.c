@@ -1,15 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
-/*
- * XILINX AXI DMA and MCDMA Engine test module
- *
- * Copyright (C) 2010 Xilinx, Inc. All rights reserved.
- *
- * Based on Atmel DMA Test Client
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
 #include <linux/delay.h>
 #include <linux/dmaengine.h>
 #include <linux/init.h>
@@ -24,9 +12,9 @@
 #include <linux/wait.h>
 #include <linux/sched/task.h>
 #include <linux/dma/xilinx_dma.h>
-#include <asm/siginfo.h>    //siginfo
-#include <linux/rcupdate.h> //rcu_read_lock
-#include <linux/sched.h>    //find_task_by_pid_type
+#include <asm/siginfo.h>   
+#include <linux/rcupdate.h> 
+#include <linux/sched.h> 
 #include <linux/sched/signal.h>
 #include <linux/string.h>
 #include <linux/list.h>
@@ -133,27 +121,6 @@ Fifo_type Axi_Fifo;
 /*
  * This two buffer was used in single dma map api
 */
-
-
-/*
- * Initialization patterns. All bytes in the source buffer has bit 7
- * set, all bytes in the destination buffer has bit 7 cleared.
- *
- * Bit 6 is set for all bytes which are to be copied by the DMA
- * engine. Bit 5 is set for all bytes which are to be overwritten by
- * the DMA engine.
- *
- * The remaining bits are the inverse of a counter which increments by
- * one for each byte address.
- */
-
-#define PATTERN_SRC		0x80
-#define PATTERN_DST		0x00
-#define PATTERN_COPY		0x40
-#define PATTERN_OVERWRITE	0x20
-#define PATTERN_COUNT_MASK	0x1f
-
-#define XILINX_DMATEST_BD_CNT	11
 
 struct dmatest_slave_thread {
 	struct list_head node; // To store the entity to the list_head threads of dmatest_chan entity
@@ -1614,6 +1581,6 @@ static void __exit axidma_exit(void)
 }
 module_exit(axidma_exit)
 
-MODULE_AUTHOR("Xilinx, Inc.");
-MODULE_DESCRIPTION("Xilinx AXI DMA Test Client");
-MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("TranNamCHY");
+MODULE_DESCRIPTION("Driver for maxpooling and conv2d");
+MODULE_LICENSE("GPL");
