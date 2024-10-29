@@ -27,7 +27,7 @@ make app
 ```
 Copy libmatrix.so at outputs folder to the folder of CNN_NETWORK, and you can run test_cpu now.
 
-Otherwise, this command will buitl both device driver and matrix_ultility.c for your board.
+Otherwise, this command will built both device driver and matrix_ultility.c for your board.
 
 ```bash
 make driver app
