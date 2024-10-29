@@ -7,7 +7,7 @@ First, you need a tool to build a kernel image for your board, you can use petal
 recommend petalinux because it was well maintained by Xilinx and don't cause two much error. Further more, we need the dma platform
 driver of Xilinx installed properly because my driver bases on it. You can find more about how to install and use it at: https://www.hackster.io/whitney-knitter/getting-started-with-the-arty-z7-in-petalinux-2020-2-c49b7a.
 
-At the final step of that guide, instead of using system.bit, you will replace it with my bit stream that include the design of Conv2d and Maxpooling.
+At the final step of that guide, instead of using system.bit, you will replace it with my bitstream that include the design of Conv2d and Maxpooling.
 
 In Petalinux, you need to enable the DMA support of Xilinx and also make some changes in the device tree, you can follow this link: https://xilinx-wiki.atlassian.net/wiki/spaces/A/pages/18842337/Linux+Soft+DMA+Driver?view=blog.
 You just need to follow the guide for axidma test when customize device tree.
