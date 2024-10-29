@@ -29,11 +29,12 @@ all: driver app
 
 # Include the specific targets for the examples, library, and driver (the
 # includes must go here, so the default target is 'all')
-include driver/driver.mk
-include app/app.mk
 # Make the specified output directory, if it doesn't exist
 $(OUTPUT_DIR):
 	@mkdir -p $(OUTPUT_DIR)
+
+include driver/driver.mk
+include app/app.mk
 
 # Clean up all temporary files
 clean: driver_clean app_clean
