@@ -30,5 +30,8 @@ Insmod your kernel module:
 ```bash
 sudo insmod driver.ko
 ```
-Copy the libmatrix.so file at outs folder to the same folder of CNN_NETWORK that you have cloned.
+Copy the libmatrix.so file at outs folder to the same folder of CNN_NETWORK that you have cloned. Now you can run the testbench for FPGA mode:
 
+```bash
+python test_fpga.py
+```
