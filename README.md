@@ -15,9 +15,17 @@ You just need to follow the guide for axidma test when customize device tree.
 After you finish the build process, you should check the built device tree if it has been changed properly. Use dtc to revert-compile the system-top.dtb file to .dtc file and check if the axidmatest has beed included. If you can
 boot your board by that image, and the log of boot process has line like "XilinxDMA@40004000 ...", that mean your image is ready to use.
 
-Now, you'll need to compile the driver by yourself. First, download the toolchain gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf at link: https://releases.linaro.org/components/toolchain/binaries/4.9-2017.01/arm-linux-gnueabihf/
-and extract. Then clone this project, and modify the config.mk file, replace the "/home/nambcn" with your local path. In case you want to native built on Zedboard, or you just want to build "matrix_ultility.c" to run on your PC,
-just change CROSS_COMPILE to "gcc". Then Just
+Now, you'll need to compile the driver by yourself, :
+
+If you need to , download the toolchain gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf at link: https://releases.linaro.org/components/toolchain/binaries/4.9-2017.01/arm-linux-gnueabihf/
+and extract. Then clone this project, and modify the config.mk file, replace the "/home/nambcn" with your local path. 
+
+In case you got error "Segmentation fault" when run CPU testbench and just want to recompile "matrix_ultility.c" to run on your PC, just change CROSS_COMPILE to "gcc", and compile by:
+
+```bash
+make app
+```
+Copy libmatrix.so at outputs folder to the folder of CNN_NETWORK, and you can run test_cpu now.
 
 ```bash
 make driver app
