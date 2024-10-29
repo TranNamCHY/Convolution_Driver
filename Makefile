@@ -1,12 +1,3 @@
-# Makefile
-#
-# Date: March 5, 2016
-# Author: Brandon Perez
-# Author: Jared Choi
-#
-# The top-level Makefile for the project, handles compilation for both the
-# driver and the example application programs
-
 # Include the user defined variables, if they specified them
 -include config.mk
 
@@ -34,17 +25,18 @@ OUTPUT_DIR ?= outputs
 .PHONY: all clean cross_compiler_check help
 
 # Compile the driver, library, and examples in release mode as the default
-all: driver
+all: driver app
 
 # Include the specific targets for the examples, library, and driver (the
 # includes must go here, so the default target is 'all')
 include driver/driver.mk
+include app/app.mk
 # Make the specified output directory, if it doesn't exist
 $(OUTPUT_DIR):
 	@mkdir -p $(OUTPUT_DIR)
 
 # Clean up all temporary files
-clean: driver_clean
+clean: driver_clean app_clean
 	rm -rf $(OUTPUT_DIR)
 
 # Check that the specified cross-compiler exists
