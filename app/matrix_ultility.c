@@ -4,6 +4,9 @@
 #include <math.h>
 #include <stdint.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
 void print_flat_matrix(float *matrix, int rows, int cols) {
     int i,j;
     for (i = 0; i < rows; i++) {
@@ -34,6 +37,24 @@ int matrix_multiply(float *matrix1, int rows1, int cols1, float *matrix2, int ro
     return 0;
 }
 
+void convolution_2d_8bit(int8_t *source_buffer, int image_height, int image_width, int8_t *kernel_buffer, int32_t* result_matrix){
+    int dest_image_height = image_height - 2; 
+    int dest_image_width = image_width - 2;
+    int i,j,k,q;
+    float tempt = 0;
+    //printf("Got in C func: %d",source_buffer[2]);
+	for(i = 0; i < dest_image_height; i++){
+		for(j = 0; j < dest_image_width; j++){
+            result_matrix[i * dest_image_width + j] = 0;
+			for(k = 0; k < 3; k++){
+				for(q = 0; q < 3; q++){
+					result_matrix[i * dest_image_width + j] += kernel_buffer[k*3 + q] * source_buffer[((i) + k ) * image_width + (j) + q];
+				}
+			}
+		}
+	}
+}
+
 void convolution_2d(float *source_buffer, int image_height, int image_width, float *kernel_buffer, float* result_matrix,char* activition,float test){
     //printf("got in conv2d c: ");
     int i,j,k,q;
@@ -54,25 +75,62 @@ void convolution_2d(float *source_buffer, int image_height, int image_width, flo
 	}
 }
 
-
-void convolution_2d_8bit(int8_t *source_buffer, int image_height, int image_width, int8_t *kernel_buffer, int32_t* result_matrix){
+void sum_vetor(float* vector1, float* vector2, int length, float* result){
+    int i;
+    for(i=0;i<length;i++){
+        result[i] = vector1[i] + vector2[i];
+    }
+}
+void convolution2d_by_tensor(float *source_buffer, int image_height, int image_width, int input_image_num_channel, float* source_kernel, int num_filter, int num_chan, float* result_matrix){
+    int i,j,c,f;
     int dest_image_height = image_height - 2; 
     int dest_image_width = image_width - 2;
-    int i,j,k,q;
-    float tempt = 0;
-    //printf("Got in C func: %d",source_buffer[2]);
-	for(i = 0; i < dest_image_height; i++){
-		for(j = 0; j < dest_image_width; j++){
-            result_matrix[i * dest_image_width + j] = 0;
-			for(k = 0; k < 3; k++){
-				for(q = 0; q < 3; q++){
-					result_matrix[i * dest_image_width + j] += kernel_buffer[k*3 + q] * source_buffer[((i) + k ) * image_width + (j) + q];
-				}
-			}
-		}
-	}
+    float accumulator_tempt[dest_image_height * dest_image_width];
+    for(f=0;f<num_filter;f++){
+        //printf("Fitler: %d\n",f);
+        for(c=0;c<num_chan;c++){
+            //printf("Channel: %d\n",c);
+            /* for(i=0;i<3;i++){
+                printf("[ ");
+                for(j=0;j<3;j++){
+                    printf("%.2f ",source_kernel[f * (3 * 3 * num_chan) + c * 3 * 3  + i * 3 + j]);
+                }
+                printf("]\n");
+            } */
+            //for(c=0;c<input_image_num_channel;c++){
+                /* printf("Number %d channel: \n",c);
+                for(i=0;i<image_height;i++){
+                    printf("[ ");
+                    for(j=0;j<image_width;j++){
+                        printf("%.2f ",source_buffer[c * image_height * image_width + i * image_width + j]);
+                    }
+                    printf("] \n"); 
+                }*/
+                //printf("Start Convd: %f\n",source_buffer[c * image_height * image_width]);
+                //printf("Start kernel: %f\n", source_kernel[f * (3 * 3 * num_chan) + c * 3 * 3]);
+                convolution_2d(&source_buffer[c * image_height * image_width], image_height, image_width, 
+                &source_kernel[f * (3 * 3 * num_chan) + c * 3 * 3], accumulator_tempt, "relu", 0);
+                sum_vetor(accumulator_tempt, &result_matrix[f * dest_image_height * dest_image_width], 
+                dest_image_height * dest_image_width, &result_matrix[f * dest_image_height * dest_image_width]);
+            //} 
+        }
+        //printf("] \n");   
+    }
+    /* for(f=0;f<num_filter;f++){
+        printf("Fitler: %d\n",f);
+        for(c=0;c<num_chan;c++){
+            printf("Channel: %d\n",c);
+            for(i=0;i<3;i++){
+                printf("[ ");
+                for(j=0;j<3;j++){
+                    printf("%.2f ",source_kernel[f * (3 * 3 * num_chan) + c * 3 * 3  + i * 3 + j]);
+                }
+                printf("]\n");
+            }
+        }
+        printf("] \n");   
+    } */
 }
-
 void relu_activition(float* source_buffer, int image_height,int image_width,float* result_matrix, float max_value){
     //printf("Got value: %f",max_value);
     int i,j; 
@@ -88,6 +146,7 @@ void relu_activition(float* source_buffer, int image_height,int image_width,floa
         }
     }
 }
+
 void maxpool_2d(float *source_buffer, int image_height, int image_width, int input_image_num_channel, float* result_matrix,int pool_size, int* x_coordinate_matrix,int* y_coordinate_matrix){
     int dest_image_height = image_height/pool_size;
     int dest_image_width = image_width/pool_size;

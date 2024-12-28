@@ -1,1 +1,0 @@
-cmd_/home/nambcn/axidma/driver/driver.o := /home/nambcn/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-ld  -EL    -r -o /home/nambcn/axidma/driver/driver.o /home/nambcn/axidma/driver/tempt.o
