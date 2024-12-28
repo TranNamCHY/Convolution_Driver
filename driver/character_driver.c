@@ -54,10 +54,6 @@ static unsigned int test_buf_size = MAX_DEST_BUFFER;
 module_param(test_buf_size, uint, 0444);
 MODULE_PARM_DESC(test_buf_size, "Size of the memcpy test buffer");
 
-static unsigned int iterations = 5;
-module_param(iterations, uint, 0444);
-MODULE_PARM_DESC(iterations,
-		 "Iterations before stopping test (default: infinite)");
 
 /*
  * Used to sending interrupt for the userspace application.
@@ -1075,7 +1071,6 @@ static int my_dmatest_add_slave_threads(int chan_num)
 	if (IS_ERR(thread->task)) {
 		pr_warn("dmatest: Failed to run thread %s-%s\n",
 			dma_chan_name(thread->tx_chan), dma_chan_name(thread->rx_chan));
-		//kfree(thread);
 		return ret;
 	}
 
@@ -1128,46 +1123,12 @@ static int my_dmatest_add_slave_channels(struct dma_chan *tx_chan,
 	 */
 	INIT_LIST_HEAD(&tx_dtc->threads);
 	INIT_LIST_HEAD(&rx_dtc->threads);
-
-	//my_dmatest_add_slave_threads(tx_dtc, rx_dtc);
-	//thread_count += 1;
-
-	//pr_info("dmatest: Started %u threads using %s %s\n",
-	//	thread_count, dma_chan_name(tx_chan), dma_chan_name(rx_chan));
-
 	/*
 	Add two dmatest_chan to the list dmatest_channels.
 	 */
 	list_add_tail(&tx_dtc->node, &dmatest_channels);
 	list_add_tail(&rx_dtc->node, &dmatest_channels);
 	nr_channels += 2;
-
-    /*
-    Wait util all thread created by dmatest_add_slave_threads finish.
-    */
-	//wait_event(thread_wait, !is_threaded_test_run(tx_dtc, rx_dtc));
-
-	/*
-	 * Send signal to the user space process 
-	 */
-	// find the task with that pid
-
-	/* if(pid < 0){
-		pr_info("Pid was not initialized !");
-		return 0;
-	}
-	rcu_read_lock();
-	t = pid_task(find_pid_ns(pid, &init_pid_ns), PIDTYPE_PID);
-	if (t != NULL) {
-    rcu_read_unlock();      
-    if (send_sig_info(SIG_TEST, &info, t) < 0) {
-			pr_info("send_sig_info error\n");
-		}
-	} else {
-    	pr_info("pid_task error\n");
-    	rcu_read_unlock();
-    	return -1;
-	} */
 
 	return 0;
 }
